@@ -100,7 +100,7 @@
         in
         crystal.buildCrystalPackage {
           pname = "gori";
-          version = "0.8.0";
+          version = "0.8.1";
 
           inherit src;
 
