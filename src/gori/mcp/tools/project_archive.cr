@@ -47,7 +47,7 @@ module Gori
         # for the path it installs to.
         begin
           ProjectArchive.resolve_destination(path, project, overwrite: overwrite,
-            loose_database: !registered, protected_dir: Paths.home_dir)
+            loose_database: !registered, protected_dir: Paths.home_dir, archives_only: true)
         rescue ex : Gori::Error
           return archive_destination_error(ex)
         end
@@ -63,7 +63,7 @@ module Gori
         begin
           replaced = overwrite && ProjectArchive.destination_exists?(Path[path].expand(home: true).to_s)
           destination = begin
-            prepared.write(path, overwrite: overwrite, protected_dir: Paths.home_dir)
+            prepared.write(path, overwrite: overwrite, protected_dir: Paths.home_dir, archives_only: true)
           rescue ex : Gori::Error
             return archive_destination_error(ex)
           rescue ex : File::Error | IO::Error
@@ -258,6 +258,7 @@ module Gori
           exec_fuzz_templates:  inventory.exec_fuzz_templates,
           exec_decoder_tabs:    inventory.exec_decoder_tabs,
           exec_env_vars:        inventory.exec_env_vars,
+          local_file_paths:     inventory.local_file_paths,
         }
         j.field "import_safety", {
           disabled_pipe_rules:         inventory.disabled_pipe_rules,
@@ -268,6 +269,7 @@ module Gori
           reset_global_overrides:      inventory.reset_global_overrides,
           disabled_auto_refresh_slots: inventory.disabled_auto_refresh_slots,
           reset_probe_mode:            inventory.reset_probe_mode.try(&.label),
+          reset_grpc_descriptors:      inventory.reset_grpc_descriptors,
         }
         j.field "disclosure", ProjectArchive.disclosure(inventory)
       end
@@ -287,7 +289,7 @@ module Gori
           s.field "path", strprop("destination file for the archive (relative paths resolve against " \
                                   "the MCP server's working directory; the result reports the absolute path)"), required: true
           s.field "project", strprop("project to export: short id, dir slug, or display name (default: the bound project)")
-          s.field "overwrite", boolprop("replace an existing file at 'path' (default false)")
+          s.field "overwrite", boolprop("replace an existing file at 'path' (default false); only an earlier gori project archive is ever replaced")
         end
 
         tool j, "import_project",

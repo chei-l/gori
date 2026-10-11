@@ -436,8 +436,10 @@ describe Gori::ProjectArchive do
         Gori::SessionSlot.serialize([Gori::SessionSlot.new("operator",
           [{"Authorization", "Bearer identity-secret"}])]))
       provider_id = store.insert_oast_provider("saved", "interactsh", "https://oast.test", "provider-token", true, 0)
-      store.insert_oast_session(provider_id, "interactsh", "https://oast.test", "correlation",
+      session_id = store.insert_oast_session(provider_id, "interactsh", "https://oast.test", "correlation",
         "session-secret", "private-key", "session-token")
+      store.touch_oast_session(session_id)
+      Gori::Probe::OutOfBand::StoreMinter.build(store).should_not be_nil
 
       exported = Gori::ProjectArchive.prepare_export(project)
       archive_path = File.join(root, "unsafe-config.gori")
@@ -453,6 +455,7 @@ describe Gori::ProjectArchive do
         disclosure.should contain("8 project network settings")
         disclosure.should contain("1 host override")
         disclosure.should contain("OAST sessions")
+        disclosure.should contain("not used for probe payloads until you resume it")
         disclosure.should contain("provider tokens")
         disclosure.should contain("Authorize identities")
 
@@ -474,6 +477,10 @@ describe Gori::ProjectArchive do
           copied.oast_providers.first.token.should eq("provider-token")
           copied.oast_sessions.first.token.should eq("session-token")
           copied.oast_sessions.first.private_key_pem.should eq("private-key")
+          # The archive's liveness stamp is dropped, so its session is no mint target here
+          # until this install resumes (stamps) it.
+          copied.oast_sessions.first.last_poll_at.should be_nil
+          Gori::Probe::OutOfBand::StoreMinter.build(copied).should be_nil
         ensure
           copied.close
         end
@@ -748,6 +755,58 @@ describe Gori::ProjectArchive do
 
   # `settings` has no `id`: its key is `key`, which every `set_setting` upserts through. Without
   # it each upsert fails inside the writer's batch, and the flows batched with it go too.
+  # A TUI export lands where the operator points it, often a shared directory: never write
+  # through a link someone else planted there, dangling or live.
+  describe ".write_export_file" do
+    it "creates a new file, replaces a confirmed regular file, and refuses a symlink" do
+      dir = File.tempname("gori-export-file")
+      Dir.mkdir(dir)
+      begin
+        fresh = File.join(dir, "issues.md")
+        Gori::ProjectArchive.write_export_file(fresh, "one\n")
+        File.read(fresh).should eq("one\n")
+        # Created under the umask, the mode `File.write` gives a new file.
+        control = File.join(dir, "control")
+        File.write(control, "")
+        File.info(fresh).permissions.should eq(File.info(control).permissions)
+        File.delete(control)
+        {% unless flag?(:win32) %}
+          File.chmod(fresh, 0o600)
+        {% end %}
+        mode = File.info(fresh).permissions
+        Gori::ProjectArchive.write_export_file(fresh, "two\n")
+        File.read(fresh).should eq("two\n")
+        File.info(fresh).permissions.should eq(mode)
+
+        victim = File.join(dir, "victim")
+        File.write(victim, "keep")
+        {victim, File.join(dir, "absent")}.each_with_index do |to, i|
+          link = File.join(dir, "link#{i}.md")
+          File.symlink(to, link)
+          expect_raises(Gori::Error, /symlink/) { Gori::ProjectArchive.write_export_file(link, "x") }
+        end
+        File.read(victim).should eq("keep")
+        File.exists?(File.join(dir, "absent")).should be_false
+        Dir.children(dir).none?(&.ends_with?(".tmp")).should be_true
+      ensure
+        FileUtils.rm_rf(dir)
+      end
+    end
+  end
+
+  # `export_project{overwrite}` asks `archive?` of a path an agent named: a FIFO there must be
+  # answered without opening it, or the open blocks the single-threaded MCP server.
+  it "answers archive? false for a FIFO without opening it" do
+    posix_only!("mkfifo")
+    path = File.tempname("gori-archive-fifo")
+    begin
+      Process.run("mkfifo", [path]).success?.should be_true
+      Gori::ProjectArchive.archive?(path).should be_false
+    ensure
+      File.delete?(path)
+    end
+  end
+
   it "refuses an archive whose settings table lost the key gori upserts through" do
     with_archive_project do |_registry, project, store, root|
       store.insert_flow(archive_request("/a"))
@@ -760,6 +819,49 @@ describe Gori::ProjectArchive do
       end
       error = expect_raises(Gori::Error) { Gori::ProjectArchive.prepare_import(archive_path) }
       error.message.not_nil!.should contain("table settings lacks the keys")
+    end
+  end
+
+  # Every column and key survives this rebuild, so only a constraint comparison sees it — and
+  # without one every capture insert in the imported project fails the CHECK (or, for a
+  # nullable column made NOT NULL, every capture that leaves it NULL).
+  {
+    {"CHECK", ", CHECK (created_at < 5000))"},
+    {"column sni", ")"},
+  }.each do |(named, tail)|
+    it "refuses an archive whose flows table carries a constraint gori's schema does not (#{named})" do
+      with_archive_project do |_registry, project, store, root|
+        store.insert_flow(archive_request("/a"))
+        store.flush
+        archive_path = export_archive(project, File.join(root, "constraint.gori"))
+        tamper_archive_database(archive_path, root) do |conn|
+          sql = conn.scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'flows'").as(String)
+          indexes = conn.query_all("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'flows' " \
+                                   "AND sql IS NOT NULL", as: String)
+          sql = sql.sub(/\bsni(\s+)TEXT,/i, "sni\\1TEXT NOT NULL DEFAULT '',") if named.starts_with?("column")
+          conn.exec("UPDATE flows SET sni = '' WHERE sni IS NULL")
+          conn.exec("ALTER TABLE flows RENAME TO flows_old")
+          conn.exec(sql.rchop(")") + tail)
+          conn.exec("INSERT INTO flows SELECT * FROM flows_old")
+          conn.exec("DROP TABLE flows_old")
+          indexes.each { |index| conn.exec(index) }
+        end
+        error = expect_raises(Gori::Error) { Gori::ProjectArchive.prepare_import(archive_path) }
+        error.message.not_nil!.should contain("table flows carries a constraint gori's schema does not (#{named})")
+      end
+    end
+  end
+
+  it "imports an archive whose tables carry only gori's own constraints" do
+    with_archive_project do |registry, project, store, root|
+      store.insert_flow(archive_request("/a"))
+      store.flush
+      prepared = Gori::ProjectArchive.prepare_import(export_archive(project, File.join(root, "plain.gori")))
+      begin
+        prepared.import_into(registry, "Plain copy").name.should eq("Plain copy")
+      ensure
+        prepared.close
+      end
     end
   end
 
@@ -962,6 +1064,37 @@ describe Gori::ProjectArchive do
         copied = Gori::Store.open(imported.db_path)
         begin
           copied.repeaters.map { |r| String.new(r.request) }.should contain(request)
+        ensure
+          copied.close
+        end
+      ensure
+        prepared.close
+      end
+    end
+  end
+
+  # A stored wordlist path names a file on the author's machine that this one reads into the
+  # requests a tab sends; the descriptor path is read on every open, so it is cleared.
+  it "names local-file wordlist paths and clears the gRPC descriptor path on import" do
+    with_archive_project do |registry, project, store, root|
+      store.insert_fuzz_session("https://archive.test", "GET /§ HTTP/1.1\r\n\r\n", false, nil,
+        %({"sets":[{"kind":"file","value":"/home/someone/.aws/credentials"},{"kind":"list","value":"a"}]}), nil, 0)
+      store.insert_miner_session("https://archive.test", "GET / HTTP/1.1\r\n\r\n".to_slice, false, nil,
+        %({"user_wordlist":"params.txt"}), nil, 0)
+      store.set_setting(Gori::Protobuf::Schemas::SETTING_KEY, "/home/someone/api.desc")
+      store.flush
+      prepared = Gori::ProjectArchive.prepare_import(export_archive(project, File.join(root, "files.gori")))
+      begin
+        prepared.inventory.local_file_paths.should eq(["/home/someone/.aws/credentials", "params.txt"])
+        disclosure = Gori::ProjectArchive.disclosure(prepared.inventory)
+        disclosure.should contain(%(2 Fuzzer or Miner wordlist paths read a local file into the requests that tab sends when run: "/home/someone/.aws/credentials", "params.txt".))
+        disclosure.should contain("clear the gRPC descriptor-set path")
+        # A path from an archive's JSON need not be valid UTF-8; the disclosure must still render.
+        odd = prepared.inventory.copy_with(local_file_paths: ["a\xffb\e[2J", "x" * 300])
+        Gori::ProjectArchive.disclosure(odd).should contain(%("a\\xffb\\x1b[2J", "#{"x" * 200}…"))
+        copied = Gori::Store.open(prepared.import_into(registry, "Files copy").db_path)
+        begin
+          copied.setting(Gori::Protobuf::Schemas::SETTING_KEY).should be_nil
         ensure
           copied.close
         end

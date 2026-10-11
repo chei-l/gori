@@ -112,14 +112,35 @@ module Gori
     # `2>&-`) made the stdlib backend's write raise EPIPE, which killed the async dispatcher's
     # fiber: about 2k entries later every `Log` call blocked for good, and `gori mcp` stopped
     # answering tools and never exited on stdin EOF. A log line nobody reads is dropped.
+    #
+    # It is also the one place a log line is made terminal-safe. A log message carries peer
+    # bytes as often as not — `alt-svc #{host}: #{note}` quotes the origin's own Alt-Svc value,
+    # so `h3=":443\e]0;PWNED\a"` retitled the operator's terminal from `gori run capture` —
+    # and patching each call site would miss the next one. `TerminalSafeLogFormat` runs the
+    # message through `Output.term_line` and the exception through `term_safe_multiline`.
     class StderrLog < ::Log::IOBackend
       def initialize
-        super(STDERR)
+        super(STDERR, formatter: TerminalSafeLogFormat)
       end
 
       def write(entry : ::Log::Entry) : Nil
         super
       rescue IO::Error
+      end
+    end
+
+    # `::Log::ShortFormat`'s layout, with the two parts that carry runtime text made safe.
+    ::Log.define_formatter TerminalSafeLogFormat, "#{timestamp} #{severity} - #{source(after: ": ")}#{message}" \
+                                                  "#{data(before: " -- ")}#{context(before: " -- ")}#{exception}"
+
+    struct TerminalSafeLogFormat
+      def message : Nil
+        @io << Output.term_line(@entry.message)
+      end
+
+      def exception(*, before = '\n', after = nil) : Nil
+        return unless ex = @entry.exception
+        @io << before << Output.term_safe_multiline(ex.inspect_with_backtrace) << after
       end
     end
 
@@ -1197,7 +1218,7 @@ module Gori
       # the value went out literally, and otherwise only an event row (when writable) records it.
       private def self.report_unbound_slot_overlay(cmd : String) : Nil
         if runner = Gori::SessionRefresh.hook.as?(Gori::SessionRefresh::Runner)
-          runner.take_outcomes.each { |o| STDERR.puts "#{cmd}: #{o.message}" unless o.ok || o.manual }
+          runner.take_outcomes.each { |o| STDERR.puts "#{cmd}: #{CLI::Output.term_line(o.message)}" unless o.ok || o.manual }
         end
         note = unbound_overlay_note(Env.take_unbound_overlay)
         STDERR.puts "#{cmd}: #{note}" if note
@@ -1313,7 +1334,7 @@ module Gori
           evidence: true)
         result = sender.send(built.bytes)
         if err = result.error
-          abort "#{cmd}: --bind-from: replaying flow ##{flow_id} failed: #{err}"
+          abort "#{cmd}: --bind-from: replaying flow ##{flow_id} failed: #{CLI::Output.term_line(err)}"
         end
         bound = bindings.values.keys
         if bound.empty?

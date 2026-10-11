@@ -513,6 +513,7 @@ module Gori
         if key = denied_permission(name)
           return key
         end
+        # `exec` is refused inside the handlers instead: see `exec_refusal`.
         # A read tool whose one argument WRITES a file sits behind `write` for that call.
         if name == "export_openapi" && @denied_permissions.includes?("write") && describes?(h, "output_path")
           return "write"
@@ -1739,7 +1740,7 @@ module Gori
           return Result.new("too many active OAST sessions (#{@oast_mcp.size}/#{MAX_OAST_SESSIONS}); call oast_stop on one before starting another", is_error: true)
         end
         prov = Oast::Provider.build(kind, host, token)
-        http = Oast::HttpClient.new(@verify_upstream)
+        http = Oast::HttpClient.new
         session = prov.register(http)
         row = persist ? persist_oast_session(session, saved) : nil
         # Unpredictable session id: a sequential "oast-N" is trivially guessable, so
@@ -1783,7 +1784,31 @@ module Gori
         return Result.new("unknown provider '#{provider}'", is_error: true) unless kind
         host = str(h, "server") || Oast::Presets.all.find { |p| p.kind == kind }.try(&.host)
         return Result.new("'server' is required for #{kind.label}", is_error: true) unless host
+        if refusal = oast_endpoint_refusal(host, "server")
+          return refusal
+        end
         {kind, host, str(h, "token")}
+      end
+
+      # An OAST endpoint an AGENT named (inline on `oast_start`, or a saved provider's host it
+      # writes), refused when the bound project's Sandbox would refuse a send there. `Oast::Http`
+      # sits outside the scope gate because its endpoints are OPERATOR configuration; one the
+      # agent picked is not, and `oast_poll` hands back what the poll fetched (a custom_http
+      # item list, a body snippet in an error), so `server: http://10.0.0.5/api/users` was a
+      # read past the Sandbox. Judged by the same Layer-2 `send_block` a hand-authored send
+      # gets. A built-in preset's host, and a provider the operator saved, stay reachable.
+      private def oast_endpoint_refusal(server : String, field : String) : Result?
+        return nil if unbound?
+        uri = URI.parse(Oast::Provider.normalize_endpoint(server)) rescue return nil
+        # No host to judge is no host to dial: `Oast::HttpClient` refuses it on its own.
+        return nil unless host = uri.host.presence
+        return nil if Oast::Presets.all.any? { |pr| URI.parse(pr.host).host.try(&.downcase) == host.downcase }
+        scheme = uri.scheme.presence || "https"
+        port = uri.port || URI.default_port(scheme) || 443
+        return nil unless why = agent_outbound(Scope.load(store), true).send_block(scheme, host, uri.request_target, port)
+        err("OAST #{field} #{host} is #{why}: with the Sandbox on, an agent may use a built-in preset " \
+            "(oast_presets) or a provider the operator saved (provider_id). Ask the operator to save " \
+            "this one or turn Sandbox off", "SCOPE_BLOCKED", field: field)
       end
 
       # Write a fresh registration into `oast_sessions` and stamp it live, returning the row id
@@ -2118,10 +2143,35 @@ module Gori
       private def permission_denied(name : String, key : String) : Result
         log_permission_denial(name, key)
         title = Settings.mcp_permission(key).try(&.title) || key
-        what = TOOL_PERMISSIONS[name]? == key ? "tool '#{name}'" : "this '#{name}' call (it sends traffic)"
+        what = if TOOL_PERMISSIONS[name]? == key
+                 "tool '#{name}'"
+               else
+                 why = case key
+                       when "exec"  then "it runs a local command"
+                       when "write" then "it writes a file"
+                       else              "it sends traffic"
+                       end
+                 "this '#{name}' call (#{why})"
+               end
         err("#{what} is disabled by the operator: \"#{title}\" is switched off in gori " \
             "Preferences › AI › MCP permissions. Ask the operator to allow it; the change applies " \
             "when this MCP server is started again.", "TOOL_DISABLED")
+      end
+
+      # The `exec` group's refusal, for a handler about to accept an argument that makes gori
+      # run a program on this machine — a pipe rule, an exec probe rule, a mine hook, a fuzz
+      # `¦chain` with an `exec:` step. Asked INSIDE the tool rather than in
+      # `call_denied_permission`, because most of these answers need state the call does not
+      # carry (is the rule being enabled a pipe rule? does the saved chain a marker names run a
+      # command?). The same TOOL_DISABLED answer and the same Activity event as a switched-off
+      # tool, so an agent and an operator read both refusals one way.
+      #
+      # It gates what an agent AUTHORS or ARMS, not what the operator armed: a probe_scan still
+      # runs the operator's enabled exec rules, as the capture pipeline already does over every
+      # flow the agent sends.
+      private def exec_refusal : Result?
+        return nil unless @denied_permissions.includes?("exec")
+        permission_denied(@calling || "", "exec")
       end
 
       # A distinct event kind keeps a refused call out of `recent_agent_actions`, which credits

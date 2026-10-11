@@ -12,6 +12,7 @@ require "./settings/network"
 require "./settings/project_network"
 require "./probe/mode"
 require "./store/schema"
+require "./protobuf/schemas"
 
 module Gori
   # A portable project archive. The archive is a ZIP containing exactly a manifest and a
@@ -68,7 +69,9 @@ module Gori
       exec_repeaters : Int32,
       exec_fuzz_templates : Int32,
       exec_decoder_tabs : Int32,
-      exec_env_vars : Int32 do
+      exec_env_vars : Int32,
+      local_file_paths : Array(String),
+      reset_grpc_descriptors : Bool do
       def summary : String
         "#{flows} #{flows == 1 ? "flow" : "flows"}, " \
         "#{session_slots} #{session_slots == 1 ? "session slot" : "session slots"}, " \
@@ -86,7 +89,27 @@ module Gori
                    "turn off automatic refresh on #{disabled_auto_refresh_slots} session " \
                    "#{disabled_auto_refresh_slots == 1 ? "slot" : "slots"}"
         reset_probe_mode.try { |mode| sentence += "; and reset Probe mode from #{mode.label} to passive" }
+        sentence += "; and clear the gRPC descriptor-set path, a local file read when the project opens" if reset_grpc_descriptors
         sentence
+      end
+
+      # Stored Fuzzer `file` sets and Miner wordlists name a path on the AUTHOR's machine that
+      # this one opens when that tab runs, and reads into requests sent to the tab's target. Like
+      # `exec:`, they act only on an explicit run, so they are disclosed (by path, so the operator
+      # can judge the file) rather than rewritten. The path is archive-authored, may not be valid
+      # UTF-8, and this sentence reaches a terminal, so it is escaped byte-wise and capped.
+      LISTED_PATHS = 5
+
+      def local_files : String?
+        return nil if local_file_paths.empty?
+        shown = local_file_paths.first(LISTED_PATHS).map do |path|
+          text = Export::Escape.comment(path)
+          text = "#{text[0, 200]}…" if text.size > 200
+          %("#{text}")
+        end
+        more = local_file_paths.size - shown.size
+        "#{local_file_paths.size} Fuzzer or Miner wordlist #{local_file_paths.size == 1 ? "path reads" : "paths read"} " \
+        "a local file into the requests that tab sends when run: #{shown.join(", ")}#{more > 0 ? " and #{more} more" : ""}."
       end
 
       # Stored `exec:` chain steps stay as the operator-visible bytes they are; they run a local
@@ -180,12 +203,14 @@ module Gori
         @closed = false
       end
 
-      # *protected_dir* is refused as a destination along with the source project; see
+      # *protected_dir* is refused as a destination along with the source project, and
+      # *archives_only* limits `overwrite` to an existing archive; see
       # `ProjectArchive.resolve_destination`, which runs again here for the path installed to.
-      def write(path : String, *, overwrite : Bool = false, protected_dir : String? = nil) : String
+      def write(path : String, *, overwrite : Bool = false, protected_dir : String? = nil,
+                archives_only : Bool = false) : String
         raise Gori::Error.new("project archive is already closed") if @closed
         target = ProjectArchive.resolve_destination(path, @project, overwrite: overwrite,
-          loose_database: @loose_database, protected_dir: protected_dir)
+          loose_database: @loose_database, protected_dir: protected_dir, archives_only: archives_only)
         temp = write_temporary_archive(target)
         begin
           install_archive(temp, target, overwrite)
@@ -273,8 +298,11 @@ module Gori
     #
     # Replacing an existing file is refused outright when it is a database a running gori has
     # open: renaming the archive over it would unlink the file that process keeps writing into.
+    # *archives_only* (MCP) also refuses replacing anything that is not already an archive
+    # (`archive?`): the operator who types a CLI path chose it; an agent's path is not a choice.
     def self.resolve_destination(path : String, source : Project, *, overwrite : Bool = false,
-                                 loose_database : Bool = false, protected_dir : String? = nil) : String
+                                 loose_database : Bool = false, protected_dir : String? = nil,
+                                 archives_only : Bool = false) : String
       target = expand_destination(path)
       canonical_target = Paths.canonical_file(target)
       refuse_source_destination(canonical_target, source, loose_database)
@@ -282,7 +310,23 @@ module Gori
         raise ProtectedDestination.new(target, dir) if Paths.within?(canonical_target, Paths.canonical_file(dir))
       end
       refuse_existing_destination(target, overwrite)
+      if archives_only && destination_exists?(target) && !archive?(target)
+        raise Gori::Error.new("destination exists and is not a gori project archive: #{target} — overwrite:true " \
+                              "replaces only an earlier export; choose another 'path'")
+      end
       target
+    end
+
+    # Whether *path* has a project archive's shape: a zip holding exactly `manifest.json` and
+    # `gori.db`, what `write_temporary_archive` writes. Read off the central directory, so a
+    # multi-GiB archive costs a seek, not a decompress; anything unreadable is not one. Only a
+    # regular file is opened: a FIFO would block the open, and the MCP server with it.
+    def self.archive?(path : String) : Bool
+      return false unless File.info(path, follow_symlinks: false).file?
+      names = Compress::Zip::File.open(path, &.entries.map(&.filename))
+      names.sort == ["gori.db", "manifest.json"]
+    rescue Compress::Zip::Error | IO::Error
+      false
     end
 
     private def self.expand_destination(path : String) : String
@@ -421,9 +465,11 @@ module Gori
     def self.disclosure(inventory : Inventory) : String
       "Contains the complete project database: #{inventory.summary}. " \
       "Import will #{inventory.import_safety}. #{inventory.exec_chains.try { |text| "#{text} " }}" \
+      "#{inventory.local_files.try { |text| "#{text} " }}" \
       "The archive is unredacted and may contain " \
       "captured request/response credentials, session and env values, and upstream proxy credentials. " \
-      "OAST sessions and provider tokens, plus Authorize identities, remain in the imported copy. " \
+      "OAST sessions and provider tokens, plus Authorize identities, remain in the imported copy; " \
+      "an imported OAST session is not used for probe payloads until you resume it. " \
       "Keep the archive as carefully as the source project."
     end
 
@@ -450,6 +496,44 @@ module Gori
     # overwrite check and fails later with a lower-level link/rename error.
     def self.destination_exists?(path : String) : Bool
       File.exists?(path) || File.symlink?(path)
+    end
+
+    # The write behind a TUI export (issues, notes, sequencer report, evidence, OpenAPI), whose
+    # overlay asked before overwriting anything `destination_exists?` saw. It never writes
+    # THROUGH a link: a destination in a shared directory such as /tmp can be a symlink another
+    # local user planted (`issues.md -> ~/.zshenv`), dangling so it read as absent, or live so
+    # the operator confirmed "file exists" for a file that is not theirs.
+    #
+    # The content is staged in a temp file beside it (created under the umask, as `File.write`
+    # would, and fsync'd), then:
+    # * an existing regular file is replaced by a rename (the confirmed overwrite; its mode is
+    #   carried over, and a crash leaves the old file, never a truncated one);
+    # * anything else that exists — a symlink, a FIFO, a device — is refused;
+    # * nothing there: hard-linked into place, which fails if anything (a link included)
+    #   appeared meanwhile. A filesystem with no hard links gets the same existence check
+    #   immediately before a rename, as `install_archive_copy` does.
+    def self.write_export_file(path : String, content : String) : Nil
+      existing = File.info?(path, follow_symlinks: false)
+      raise Gori::Error.new("refusing to write through a symlink or special file: #{path}") if existing && !existing.file?
+      staged = File.tempname(".#{File.basename(path)}", ".tmp", dir: File.dirname(path))
+      File.open(staged, "w", perm: File::Permissions.new(0o666)) do |file|
+        file.print(content)
+        file.flush
+        file.fsync
+      end
+      if existing
+        File.chmod(staged, existing.permissions)
+        File.rename(staged, path)
+        return
+      end
+      begin
+        File.link(staged, path)
+      rescue IO::Error
+        raise DestinationExists.new(path) if destination_exists?(path)
+        File.rename(staged, path)
+      end
+    ensure
+      staged.try { |t| File.delete?(t) }
     end
 
     private def self.private_tempdir(prefix : String) : String
@@ -542,11 +626,37 @@ module Gori
       exec_env_vars = setting(conn, Env::PROJECT_VARS_KEY).try do |raw|
         Env.parse_vars_json(raw).count { |(_, value)| exec_text?(value) }
       end || 0
+      reset_grpc_descriptors = !setting(conn, Protobuf::Schemas::SETTING_KEY).try(&.strip.presence).nil?
       Inventory.new(flows, slots, env_vars, upstream_credentials,
         disabled_pipe_rules, disabled_exec_probe_rules, disabled_body_file_stubs,
         reset_network_settings, reset_host_overrides, reset_global_overrides,
         disabled_auto_refresh_slots, reset_probe_mode,
-        exec_repeaters, exec_fuzz_templates, exec_decoder_tabs, exec_env_vars)
+        exec_repeaters, exec_fuzz_templates, exec_decoder_tabs, exec_env_vars,
+        local_file_paths(conn, tables), reset_grpc_descriptors)
+    end
+
+    # Every stored path a tab opens when run: a Fuzzer payload set of kind `file`
+    # (`FuzzerView#config_json`) and a Miner's `user_wordlist` (`MinerView`). Tolerant, like
+    # the other counts: a config this build cannot parse names nothing.
+    private def self.local_file_paths(conn : DB::Connection, tables : Array(String)) : Array(String)
+      paths = [] of String
+      if tables.includes?("fuzz_sessions")
+        conn.query_each("SELECT CAST(config AS BLOB) FROM fuzz_sessions") do |rs|
+          sets = rs.read(Bytes?).try { |b| json?(String.new(b)).try(&.as_h?).try(&.["sets"]?).try(&.as_a?) }
+          sets.try &.each do |set|
+            o = set.as_h? || next
+            next unless o["kind"]?.try(&.as_s?) == "file"
+            o["value"]?.try(&.as_s?).try(&.presence).try { |path| paths << path }
+          end
+        end
+      end
+      if tables.includes?("miner_sessions")
+        conn.query_each("SELECT CAST(config AS BLOB) FROM miner_sessions") do |rs|
+          rs.read(Bytes?).try { |b| json?(String.new(b)).try(&.as_h?).try(&.["user_wordlist"]?).try(&.as_s?).try(&.presence) }
+            .try { |path| paths << path }
+        end
+      end
+      paths
     end
 
     # A Fuzzer session's template, or its gRPC field chains (`role¦exec:…`,
@@ -642,10 +752,16 @@ module Gori
     # into it then fails inside the writer's batch, taking the flows batched with it. Judged
     # after migrating the copy, against a fresh schema, so an older archive is held to the keys
     # it will have once opened; a table the fresh schema lacks is left to the column checks.
+    #
+    # The converse is held the same way: a table may carry no constraint gori's own schema does
+    # not. A `CHECK (created_at < 1000)` on flows passes every column check and then fails every
+    # capture insert; the same on scope_rules or settings silently refuses an exclude or the
+    # sandbox flag. Compared against the fresh schema rather than a list, so a constraint gori
+    # itself adds later is not refused.
     private def self.refuse_missing_keys!(path : String) : Nil
-      expected = DB.open("sqlite3::memory:") do |db|
+      expected, expected_constraints = DB.open("sqlite3::memory:") do |db|
         Store::Schema.migrate!(db)
-        key_shapes(db)
+        {key_shapes(db), constraint_shapes(db)}
       end
       DB.open("sqlite3:#{path}?busy_timeout=5000") do |db|
         Store::Schema.migrate!(db)
@@ -655,7 +771,53 @@ module Gori
           next if got.nil? || got == shape
           raise Gori::Error.new("project archive database table #{table} lacks the keys gori writes through; refusing to import it")
         end
+        constraint_shapes(db).each do |table, (columns, clauses)|
+          if foreign = foreign_constraint(columns, clauses, expected_constraints[table]?)
+            raise Gori::Error.new("project archive database table #{table} carries a constraint gori's schema " \
+                                  "does not (#{foreign}); refusing to import it")
+          end
+        end
       end
+    end
+
+    # Per table, what can make a write gori issues fail or change: each column's {NOT NULL,
+    # default, generated/hidden} as SQLite parses it, and how often the stored CREATE text
+    # spells a clause no pragma reports. A keyword inside a quoted name or a comment over-counts,
+    # which only ever refuses a crafted file: gori writes none of them into a table.
+    CONSTRAINT_WORDS = {"CHECK" => /\bCHECK\b/i, "COLLATE" => /\bCOLLATE\b/i, "REFERENCES" => /\bREFERENCES\b/i}
+
+    alias ColumnShape = {Bool, String?, Bool}
+    alias ConstraintShape = {Hash(String, ColumnShape), Hash(String, Int32)}
+
+    private def self.constraint_shapes(db : DB::Database) : Hash(String, ConstraintShape)
+      db.using_connection do |conn|
+        conn.query_all("SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE type = 'table' " \
+                       "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'", as: {String, String}).to_h do |table, sql|
+          columns = conn.query_all("SELECT name, \"notnull\", dflt_value, hidden FROM pragma_table_xinfo(?)",
+            table, as: {String, Int64, String?, Int64}).to_h do |name, notnull, dflt, hidden|
+            {name, {notnull != 0, dflt, hidden != 0}}
+          end
+          {table, {columns, CONSTRAINT_WORDS.transform_values { |rx| sql.scan(rx).size }}}
+        end
+      end
+    end
+
+    # What the archive's table adds over gori's, named for the refusal, or nil. A table gori's
+    # schema lacks is left alone, as the key check leaves it: gori never writes there.
+    private def self.foreign_constraint(columns : Hash(String, ColumnShape), clauses : Hash(String, Int32),
+                                        want : ConstraintShape?) : String?
+      want_columns, want_clauses = want || return nil
+      clauses.each { |word, n| return word if n > (want_clauses[word]? || 0) }
+      columns.each do |name, column|
+        if known = want_columns[name]?
+          return "column #{name}" unless column == known
+        else
+          # An extra column is harmless only while gori's INSERTs can leave it out.
+          notnull, dflt, hidden = column
+          return "column #{name}" if hidden || (notnull && dflt.nil?)
+        end
+      end
+      nil
     end
 
     # {primary-key columns with their declared type, every UNIQUE index's columns} per table.
@@ -702,6 +864,10 @@ module Gori
               # Probe mode is authorization, not configuration: an archive must not arm active
               # probes that fire at the stored flows the moment the copy is opened.
               conn.exec("DELETE FROM settings WHERE key = ?", Probe::MODE_SETTING_KEY)
+              # Read from disk every time the project opens, unasked: a path on the author's
+              # machine names, on this one, whatever file the operator never chose. Machine-local,
+              # like the host overrides; the importer points it at their own descriptors.
+              conn.exec("DELETE FROM settings WHERE key = ?", Protobuf::Schemas::SETTING_KEY)
               disable_slot_auto_refresh(conn)
             end
             conn.exec("DELETE FROM host_overrides") if table_exists?(conn, "host_overrides")
@@ -713,6 +879,13 @@ module Gori
             end
             if table_exists?(conn, "probe_custom_rules")
               conn.exec("UPDATE probe_custom_rules SET enabled = 0 WHERE lower(kind) = 'exec'")
+            end
+            # The active scan mints its out-of-band payloads against the most-recently-polled
+            # session, so a stamp carried in the archive would choose where this install's probes
+            # call home. Unstamped, an imported session is never a mint target until the operator
+            # resumes it here (`OutOfBand::StoreMinter.pick_session`).
+            if table_exists?(conn, "oast_sessions") && table_columns(conn, "oast_sessions").includes?("last_poll_at")
+              conn.exec("UPDATE oast_sessions SET last_poll_at = NULL")
             end
             conn.exec("COMMIT")
           rescue ex

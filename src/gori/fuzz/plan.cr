@@ -214,6 +214,9 @@ module Gori::Fuzz
     # when it cannot (the default: one-shot CLI and MCP). The live TUI passes false — it must not
     # stall its frame waiting for a writer — and reads the backlog off the report instead.
     property? project_drain_fts : Bool
+    # Whether a `¦chain` may run an `exec:` step (false: MCP's `exec` denied, see
+    # `MCP::Tools#exec_refusal`). Checked before the seed rendering, which already runs a chain.
+    property? commands_allowed : Bool
 
     def initialize(@template : String = "",
                    *,
@@ -235,8 +238,13 @@ module Gori::Fuzz
                    @grpc_fields : Array(String) = [] of String,
                    @ws_messages : Array(WsMessageSource)? = nil,
                    @project : Gori::Store? = nil,
-                   @project_drain_fts : Bool = true)
+                   @project_drain_fts : Bool = true,
+                   @commands_allowed : Bool = true)
     end
+  end
+
+  # `Plan.build`'s refusal under `commands_allowed? == false`; not a `PlanError::Reason`.
+  class CommandsRefused < Exception
   end
 
   # A ready-to-run fuzz job: THE only place a `Fuzz::Engine` is constructed.
@@ -539,6 +547,9 @@ module Gori::Fuzz
       # the wire. See `refuse_unrunnable_chains` (the shared validator the Repeater send path
       # also calls).
       refuse_unrunnable_chains(marked.positions, Decoder.shared_registry)
+      if !options.commands_allowed? && marked.runs_commands?(Decoder.shared_registry)
+        raise CommandsRefused.new("a §…§ position's ¦chain runs a local command")
+      end
 
       origin = resolve_origin(options)
 

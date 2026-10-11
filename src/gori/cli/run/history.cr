@@ -1205,7 +1205,7 @@ module Gori
           end
           puts "=== RESPONSE ==="
           if err = detail.error
-            puts "error: #{err}"
+            puts "error: #{CLI::Output.term_line(err)}"
           end
           if h = detail.response_head
             print_message_text(h, display_body(h, detail.response_body), detail.response_body, cap)
@@ -1393,6 +1393,8 @@ module Gori
               j.field "grpc_status_name", Proxy::H2::Grpc.status_name(gs)
               j.field "grpc_message", gm.scrub if gm
             end
+            # One output budget for the whole body, not one per message (`Protobuf::JsonBudget`).
+            budget = Protobuf::JsonBudget.new
             j.field "messages" do
               j.array do
                 msgs.each_with_index do |m, i|
@@ -1419,7 +1421,7 @@ module Gori
                     else
                       decoded = Protobuf.decode(m.data)
                       j.field "protobuf" do
-                        decoded.to_json(j)
+                        decoded.to_json(j, budget)
                       end
                       # The lens, beside the raw tree and never over it (P7): `protobuf` stays
                       # the octet-level report that names every reading a payload fits, and
