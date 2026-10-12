@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Repeater: two palette-only transforms grow one GraphQL operation into N copies in a single request — a batched JSON array or the top-level field repeated under `aN:` aliases — to test per-request rate-limit / brute-force bypass, in one undoable edit (#1595)
 - MCP serves the docs playbooks as prompts (`prompts/list`, `prompts/get`), so Claude Code offers each as a `/mcp__gori__<name>` slash command with an optional `focus` (#1596)
 - Rewriter: `json_set` and `json_remove` rules set or delete a JSON body or WebSocket value by path (`$.user.role`, `$.items[-1]`), changing only that value's bytes, on the TUI, `gori run rewriter add --op` and MCP `create_rule`; gori v0.8.0 and later list such a rule as inert, and an older gori reads it as a literal `replace` (#1599)
 - QL: `ws:`/`ws~` finds flows by their WebSocket message payloads, and History's MESSAGES pane, `gori run show --ws-match` and MCP `get_flow` `ws_query` narrow one transcript (#1588)
