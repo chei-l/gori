@@ -209,9 +209,9 @@ module Gori
 
         # Blank // line comments, /* */ block comments, and '…' / "…" / `…` string literals,
         # replacing their CONTENTS with spaces so byte/char offsets are preserved. A single
-        # conservative left-to-right pass. Regex literals are intentionally left intact:
-        # telling `/` division from a regex needs a parser, and regex bodies rarely carry our
-        # tokens. Every consumed char emits exactly one char, so indices stay aligned.
+        # conservative left-to-right pass. Regex literals are consumed as one token but kept
+        # verbatim (see `lex_regex`): a `"` or `//` inside one must not open a string or a
+        # comment. Every consumed char emits exactly one char, so indices stay aligned.
         def self.strip(js : String) : String
           return js if js.empty?
           String.build(js.bytesize) { |io| lex(js, Sink.new(io, nil)) }
@@ -263,22 +263,28 @@ module Gori
         private def self.lex(js : String, out_to : Sink) : Nil
           scan_source(js) do |chars, n|
             i = 0
+            last = -1 # index of the last non-space CODE char, for `regex_start?`
             while i < n
               # The token dispatch is spelled out here rather than delegated to a nilable-result
               # helper: the OVERWHELMINGLY common case is an ordinary code character, and deciding
               # it from the char in the loop keeps this hot path on a plain Int32. The branch
-              # order (comment, then string) is what both projections have always used.
+              # order (comment, then string, then regex) is what both projections use.
               c = chars[i]
-              i = if c == '/' && i + 1 < n && chars[i + 1] == '/'
-                    blank_line_comment(chars, i, n, out_to)
-                  elsif c == '/' && i + 1 < n && chars[i + 1] == '*'
-                    blank_block_comment(chars, i, n, out_to)
-                  elsif quote?(c)
-                    lex_string(chars, i, n, out_to, 0)
-                  else
-                    out_to << c
-                    i + 1
-                  end
+              if c == '/' && i + 1 < n && chars[i + 1] == '/'
+                i = blank_line_comment(chars, i, n, out_to)
+              elsif c == '/' && i + 1 < n && chars[i + 1] == '*'
+                i = blank_block_comment(chars, i, n, out_to)
+              elsif quote?(c)
+                i = lex_string(chars, i, n, out_to, 0)
+                last = i - 1 # a literal ends an operand: its closing delimiter makes a `/` division
+              elsif c == '/' && regex_start?(chars, last)
+                i = lex_regex(chars, i, n, out_to)
+                last = i - 1
+              else
+                out_to << c
+                last = i unless c.ascii_whitespace?
+                i += 1
+              end
             end
           end
         end
@@ -296,6 +302,70 @@ module Gori
             chars = js.chars
             yield chars, chars.size
           end
+        end
+
+        # Code chars after which a `/` starts a regex literal rather than a division. A `)` or `]`
+        # is not here (`(a)/b`, `x[0]/2`), and neither is an identifier other than REGEX_KEYWORDS:
+        # the usual heuristic, wrong on shapes like `if (x) /re/.test(y)`. Nor are `<` and `>`:
+        # raw JSX's `</div>` and `<b>/path</b>` are far commoner than `a < /re/`.
+        REGEX_AFTER = "(,=:[!&|?{};+-*%~^"
+
+        # Keywords after which a `/` opens a regex (`return/^a/.test(e)`, minified).
+        REGEX_KEYWORDS = %w[return typeof case delete void in of new throw yield await]
+
+        # Can a `/` start a regex here? `last` is the index of the last non-space code char (-1
+        # at the start of the fragment).
+        private def self.regex_start?(chars, last : Int32) : Bool
+          return true if last < 0
+          p = chars[last]
+          if p == '+' || p == '-'
+            # `a++ / b`: a postfix ++/-- ends an operand.
+            !(last > 0 && chars[last - 1] == p)
+          elsif REGEX_AFTER.includes?(p)
+            true
+          elsif ident_char?(p)
+            start = last
+            while start > 0 && ident_char?(chars[start - 1])
+              start -= 1
+            end
+            len = last - start + 1
+            REGEX_KEYWORDS.any? do |kw|
+              kw.bytesize == len && (0...len).all? { |k| chars[start + k] == kw.byte_at(k).unsafe_chr }
+            end
+          else
+            false
+          end
+        end
+
+        private def self.ident_char?(ch : Char) : Bool
+          ch.ascii_alphanumeric? || ch == '_' || ch == '$'
+        end
+
+        # Consume a regex literal: through its closing `/`, honoring `\` escapes and `[…]`
+        # classes (a `/` inside a class does not close it), or up to a newline if unterminated.
+        # Emitted verbatim on both sides — a regex body is code, not string content — so neither
+        # view's offsets move. The flags after it are ordinary identifier chars.
+        private def self.lex_regex(chars, i : Int32, n : Int32, out_to : Sink) : Int32
+          out_to << '/'
+          i += 1
+          in_class = false
+          while i < n
+            ch = chars[i]
+            break if ch == '\n'
+            out_to << ch
+            i += 1
+            if ch == '\\' && i < n && chars[i] != '\n'
+              out_to << chars[i]
+              i += 1
+            elsif ch == '['
+              in_class = true
+            elsif ch == ']'
+              in_class = false
+            elsif ch == '/' && !in_class
+              break
+            end
+          end
+          i
         end
 
         # Template-literal nesting recurses one frame per level (lex_string → lex_interpolation
@@ -476,7 +546,7 @@ module Gori
           {/\bfetch\s*\(/, "fetch", 0},
           {/(?<!window)\.open\s*\(/, "XMLHttpRequest.open", 1},
           {/\baxios(?:\.(?:get|post|put|patch|delete|request))?\s*\(/, "axios", 0},
-          {/\$\.(?:ajax|get|post|getJSON)\s*\(/, "jQuery.ajax", 0},
+          {/(?:\$|\bjQuery)\.(?:ajax|get|post|getJSON)\s*\(/, "jQuery.ajax", 0},
           {/\bnew\s+Request\s*\(/, "Request", 0},
         ] of {Regex, String, Int32}).map { |(re, label, arg)| {Utf8.tolerant(re), label, arg} }
 
@@ -502,35 +572,59 @@ module Gori
         # path around it (`+` or a template) to traverse.
         WHOLE_URL = Set{"location.href", "document.URL", "document.documentURI", "document.baseURI", "document.location"}
 
+        # SOURCES entries that are not URL-controlled, so not CSPT sources: a cookie or a stored
+        # value is not something a link can set.
+        NOT_URL = Set{"document.cookie", "web storage"}
+
+        # Request calls of one kind read per script: real bundles have tens, and a hostile run of
+        # `fetch({` stalled the proxy's fiber (P6).
+        MAX_SINK_HITS = 512
+
         # CSPT suspects in one STRIPPED script: {source label, sink label} for every request sink
         # whose URL argument holds a taint source not wrapped in `encodeURIComponent(…)`. Only the
         # URL counts: a source in the options (`{body: location.search}`), or in a config object
         # outside its `url:` key, is not CSPT. `encodeURI` is NOT a sanitizer here — it leaves `/`
         # and `.` alone, so `../` survives it. `sources` is the script's `source_spans`, shared
-        # with DomXss through `Context#client_source_index`.
-        def self.request_source_pairs(code : String, sources = source_spans(code)) : Array({String, String})
+        # with DomXss through `Context#client_source_index`. `messages` says the script listens
+        # for postMessage; without it `e.data` is far likelier a response (`axios(…).then(e=>…)`).
+        def self.request_source_pairs(code : String, sources = source_spans(code), messages = false) : Array({String, String})
           pairs = [] of {String, String}
           all = nil
-          bytes = code.to_slice
           REQUEST_SINKS.each do |(sink_re, sink_label, arg)|
             next if arg == 1 && !XHR.matches?(code)
+            found = hits = 0
+            # End of the last URL span read: a call nested in it was already read (keeps the walk
+            # linear). Only the URL span: a call in a config's `success:` callback is its own request.
+            past = 0
             code.scan(sink_re) do |m|
+              next if m.byte_begin(0) < past
+              break if (hits += 1) > MAX_SINK_HITS
               # Router sources are scanned on the first sink hit, so a script with no request
               # sink pays nothing for them, and one with no source at all returns here.
-              all ||= sources + router_spans(code)
+              all ||= sources.reject { |(_, label)| NOT_URL.includes?(label) || (!messages && label == "postMessage data") } +
+                      router_spans(code)
               return pairs if all.empty?
               lo, hi = argument_span(code, m.byte_end(0), arg)
               lo, hi = config_url_span(code, lo, hi)
-              all.each do |(spans, label)|
-                next if WHOLE_URL.includes?(label) && !composed?(bytes, lo, hi)
-                if unencoded_within?(code, spans, lo, hi)
-                  pairs << {label, sink_label}
-                  break
-                end
-              end
+              past = hi if lo < hi
+              next unless label = url_source(code, all, lo, hi)
+              pair = {label, sink_label}
+              next if pairs.includes?(pair)
+              pairs << pair
+              break if (found += 1) == all.size # every label already paired with this sink
             end
           end
           pairs
+        end
+
+        # The first source (in `all`'s order) used unencoded in the URL span [lo, hi), or nil.
+        private def self.url_source(code : String, all : SourceIndex, lo : Int32, hi : Int32) : String?
+          bytes = code.to_slice
+          all.each do |(spans, label)|
+            next if WHOLE_URL.includes?(label) && !composed?(bytes, lo, hi)
+            return label if unencoded_within?(code, spans, lo, hi, label == "location.search")
+          end
+          nil
         end
 
         # ROUTER_SOURCES occurrences in the same shape as `source_spans`, appended after it so a
@@ -622,15 +716,32 @@ module Gori
 
         # Does `spans` hold an occurrence inside [lo, hi) that no `encodeURIComponent(` call
         # around it covers? Walks outward from each candidate to its enclosing `(`s, within the
-        # argument, and checks the identifier in front of each.
-        private def self.unencoded_within?(code : String, spans : Array({Int32, Int32}), lo : Int32, hi : Int32) : Bool
+        # argument, and checks the identifier in front of each. With `query`, an occurrence
+        # used whole is skipped too (see `whole_query?`).
+        private def self.unencoded_within?(code : String, spans : Array({Int32, Int32}), lo : Int32, hi : Int32, query = false) : Bool
           return false unless first = spans.bsearch_index { |(b, _)| b >= lo }
           bytes = code.to_slice
           spans.each(within: first..) do |(b, e)|
             break if e > hi
+            next if query && whole_query?(bytes, b, e, lo)
             return true unless encoded_at?(bytes, b, lo)
           end
           false
+        end
+
+        URL_SEARCH_PARAMS = "URLSearchParams".to_slice
+
+        # Is the `location.search` at [b, e) appended whole? It starts with `?`, so it can only
+        # land in the query, never the path. It counts when a value is taken out of it
+        # (`.slice(1)`, `[…]`) or it feeds `URLSearchParams(…)` (whose `.get` is the value).
+        private def self.whole_query?(bytes : Bytes, b : Int32, e : Int32, lo : Int32) : Bool
+          k = skip_space(bytes, e, bytes.size)
+          return false if k < bytes.size && (bytes[k] == '.'.ord || bytes[k] == '['.ord)
+          k = b - 1
+          while k >= lo && bytes[k].unsafe_chr.ascii_whitespace?
+            k -= 1
+          end
+          !(k >= lo && bytes[k] == '('.ord && word_before?(bytes, lo, k, URL_SEARCH_PARAMS))
         end
 
         ENCODER = "encodeURIComponent".to_slice

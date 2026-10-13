@@ -103,6 +103,36 @@ describe Gori::Probe::Passive::JsScan do
     end
   end
 
+  # A regex literal's `\/\/` or `"` used to open a comment or a string and blank the rest of a
+  # one-line minified bundle (axios' isAbsoluteURL, lodash's escape table).
+  describe "regex literals" do
+    it "keeps a regex verbatim and does not let it open a comment or a string" do
+      src = %(function i(e){return/^([a-z][a-z\\d+\\-.]*:)?\\/\\//i.test(e)};el.innerHTML=location.hash)
+      JsScan.strip(src).should eq(src)
+      JsScan.source_sink_pairs(JsScan.strip(src)).should eq([{"location.hash", "innerHTML"}])
+      src = %(var E=/[&<>"']/g;fetch("/a/"+location.hash.slice(1)))
+      JsScan.request_source_pairs(JsScan.strip(src)).should eq([{"location.hash", "fetch"}])
+      # A `/` inside a class does not close it; an escaped one does not either.
+      JsScan.strip(%(x=/[/"]\\/"/;y="z")).should eq(%(x=/[/"]\\/"/;y=" "))
+    end
+
+    it "leaves division as code" do
+      JsScan.strip(%(x=a/b/c;y="//s")).should eq(%(x=a/b/c;y="   "))
+      JsScan.strip(%(x=(a)/2/"q";)).should eq(%(x=(a)/2/" ";))
+      JsScan.strip(%(x=i++/2/"q";)).should eq(%(x=i++/2/" ";))
+      JsScan.strip(%(x=/r/g/"q";)).should eq(%(x=/r/g/" ";))
+    end
+
+    it "reads a raw JSX closing tag as markup, not a regex" do
+      src = "return <div>{x}</div>; // it's fine\nel.innerHTML = location.hash;"
+      JsScan.source_sink_pairs(JsScan.strip(src)).should eq([{"location.hash", "innerHTML"}])
+    end
+
+    it "stops an unterminated regex at the end of its line" do
+      JsScan.strip(%(x=/abc\ny="q")).should eq(%(x=/abc\ny=" "))
+    end
+  end
+
   # source_in_window works on BYTE offsets: char-index slicing was O(1) only while the script
   # stayed all-ASCII, and one non-ASCII byte turned every window slice into a walk from the
   # start of the string (measured 9ms -> 1765ms per flow). The pairs must be identical either
@@ -142,6 +172,7 @@ describe Gori::Probe::Passive::JsScan do
       pairs.call(%(const x = new XMLHttpRequest(); xhr.open("GET", "/a/" + location.hash);))
         .should eq([{"location.hash", "XMLHttpRequest.open"}])
       pairs.call(%($.ajax("/a/" + this.$route.params.id);)).should eq([{"route.params", "jQuery.ajax"}])
+      pairs.call(%(jQuery.getJSON("/a/" + location.hash);)).should eq([{"location.hash", "jQuery.ajax"}])
       pairs.call(%(new Request(url.searchParams.get("p"));)).should eq([{"searchParams.get()", "Request"}])
     end
 
@@ -167,6 +198,35 @@ describe Gori::Probe::Passive::JsScan do
       pairs.call(%(fetch(window.location.href, {headers: h});)).should be_empty
       pairs.call(%(fetch(document.URL);)).should be_empty
       pairs.call(%(fetch(location.pathname + "/data");)).should eq([{"location.href", "fetch"}])
+    end
+
+    it "does not pair a whole location.search, which can only land in the query" do
+      pairs.call(%(fetch("/api/items" + location.search);)).should be_empty
+      pairs.call(%(fetch(`/api/items${location.search}`);)).should be_empty
+      pairs.call(%(fetch("/api/items/" + location.search.slice(1));)).should eq([{"location.search", "fetch"}])
+      pairs.call(%(fetch("/a/" + location.search [1]);)).should eq([{"location.search", "fetch"}])
+    end
+
+    it "reports each source → sink once, and walks nested calls once" do
+      pairs.call(%(fetch("/a/"+location.hash);fetch("/b/"+location.hash);fetch("/c/"+location.hash);))
+        .should eq([{"location.hash", "fetch"}])
+      pairs.call("fetch(location.hash+" * 13_107).should eq([{"location.hash", "fetch"}])
+      # A config with no `url:` moves nothing past; the hit cap bounds the walk instead.
+      hostile = "location.hash;" + "fetch({" * 37_449
+      started = Time.instant
+      pairs.call(hostile).should be_empty
+      (Time.instant - started).should be < 100.milliseconds # ~230 ms uncapped
+      # A nested call's own source is still read, as part of the outer argument.
+      pairs.call(%(fetch("/a/" + fetch("/b/" + location.hash));)).should eq([{"location.hash", "fetch"}])
+      # A call outside the config's URL is its own request, not a nested URL.
+      pairs.call(%($.ajax({url: "/x", success: function(){ $.ajax("/a/" + location.hash) }});))
+        .should eq([{"location.hash", "jQuery.ajax"}])
+    end
+
+    it "does not pair a source a URL cannot set" do
+      pairs.call(%(fetch("/a/" + localStorage.getItem("id"));)).should be_empty
+      pairs.call(%(fetch("/a/" + document.cookie);)).should be_empty
+      pairs.call(%(fetch("/a/" + document.referrer);)).should eq([{"document.referrer", "fetch"}])
     end
 
     it "reads only the URL argument" do

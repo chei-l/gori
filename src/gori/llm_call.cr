@@ -129,9 +129,25 @@ module Gori
           @text.clear
           @tools.clear
           LlmCall.obj(r["response"]?).try { |x| responses(x) }
-        elsif type == "response.output_text.delta"
-          @shaped = true
+        elsif type.starts_with?("response.")
+          response_event(type, r)
+        end
+      end
+
+      # Any Responses event shapes the reply, so a stream cut off mid-call still decodes. A
+      # function call is keyed by `output_index`, the slot `response.completed` uses.
+      private def response_event(type : String, r : Obj) : Nil
+        @dialect = RESPONSES
+        @shaped = true
+        i = LlmCall.index(r["output_index"]?, 0)
+        case type
+        when "response.output_text.delta"
           @text << LlmCall.str(r["delta"]?)
+        when "response.output_item.added"
+          item = LlmCall.obj(r["item"]?) || return
+          tool(i, LlmCall.str(item["name"]?), nil) if item["type"]? == "function_call"
+        when "response.function_call_arguments.delta"
+          tool(i, nil, LlmCall.str(r["delta"]?))
         end
       end
 
@@ -164,7 +180,7 @@ module Gori
           @model = LlmCall.str(msg["model"]?) || @model
           usage(msg["usage"]?)
         when "content_block_start"
-          LlmCall.obj(r["content_block"]?).try { |b| block(LlmCall.index(r["index"]?, 0), b) }
+          LlmCall.obj(r["content_block"]?).try { |b| block(LlmCall.index(r["index"]?, 0), b, streamed: true) }
         when "content_block_delta"
           d = LlmCall.obj(r["delta"]?) || return
           @text << LlmCall.str(d["text"]?)
@@ -175,14 +191,15 @@ module Gori
         end
       end
 
-      private def block(i : Int32, b : Obj) : Nil
+      private def block(i : Int32, b : Obj, streamed = false) : Nil
         case LlmCall.str(b["type"]?)
         when "text"
           @text << LlmCall.str(b["text"]?)
         when "tool_use"
           input = LlmCall.obj(b["input"]?)
-          # A streamed block opens with `input: {}` and fills it from `input_json_delta`s.
-          tool(i, LlmCall.str(b["name"]?), input.nil? || input.empty? ? nil : input.to_json)
+          # A streamed block opens with `input: {}` and fills it from `input_json_delta`s; in a
+          # whole message `{}` is the real (empty) input.
+          tool(i, LlmCall.str(b["name"]?), streamed && input.try(&.empty?) ? nil : input.try(&.to_json))
         end
       end
 

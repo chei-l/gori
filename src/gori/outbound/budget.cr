@@ -17,19 +17,25 @@ module Gori
     class Budget
       LEASE_SPAN_US = Store::OUTBOUND_LEASE_SPAN_US
       # A lease when only the total is set: no rate to size it by.
-      # ponytail: a process that exits without `release` (only the CLI calls it) keeps at most one
-      # lease of the total; release from every surface's shutdown if that ever matters.
+      # A process killed before its store closes keeps its lease: at most a quarter of what was
+      # left (`Store#lease_outbound_slots`).
       COUNT_LEASE = 8
       NAP_US      = Pacing::NAP_SLICE.total_microseconds.to_i64
       # Consecutive failed leases (~5s) before a send is refused rather than left waiting.
       MAX_FAILED_LEASES = 20
 
-      # ponytail: never evicted, so a process that opens many projects keeps one small Budget
-      # (and its Store reference) per project it ever sent from. Evict on Store close if it matters.
+      # Evicted by `Budget.release(store)` as the store closes.
       @@budgets = {} of UInt64 => Budget
 
       def self.for(store : Store) : Budget
-        @@budgets[store.object_id] ||= new(store)
+        @@budgets[store.object_id] ||= new(store).tap { store.before_close { release(store) } }
+      end
+
+      # `release` for whatever this process built over `store`, without building one, and forget
+      # it: a store closing is the end of its sends whichever Outbound made them. `for` hooks it
+      # onto the store's close, so every surface's close runs it.
+      def self.release(store : Store) : Nil
+        @@budgets.delete(store.object_id).try(&.release)
       end
 
       def self.now_us : Int64
@@ -49,8 +55,12 @@ module Gori
       @spent = false
       @failed = 0
       @lock = Mutex.new
+      # One reload per `Outbound::RELOAD_INTERVAL` for the whole process: MCP and the TUI build a
+      # fresh Outbound per send, so a throttle kept there would never come due.
+      @last_reload : Time::Instant
 
       def initialize(@store : Store)
+        @last_reload = Time.instant
         reload
       end
 
@@ -58,7 +68,7 @@ module Gori
         @interval_us > 0 || !@max.nil?
       end
 
-      # Re-read the two settings rows. `Outbound#refresh` calls this on its own throttle.
+      # Re-read the two settings rows. `admit` calls this on its own throttle.
       def reload : Nil
         rps = @store.setting(Settings::PROJECT_OUTBOUND_MAX_RPS_KEY).try(&.to_f?)
         @interval_us = if rps && rps.finite? && rps > 0
@@ -76,6 +86,10 @@ module Gori
       # `BUDGET_STOPPED_ERROR` when `halt` turned true during a wait (checked every NAP_SLICE),
       # `BUDGET_UNAVAILABLE_ERROR` when the project DB will not take a lease.
       def admit(halt : Proc(Bool)?) : String?
+        if (now = Time.instant) - @last_reload >= RELOAD_INTERVAL
+          @last_reload = now
+          reload
+        end
         return nil unless configured?
         loop do
           if slot = take(Budget.now_us)
@@ -133,6 +147,11 @@ module Gori
         else
           at
         end
+      end
+
+      # Count `n` admitted slots that will not be sent back toward the total, on the next lease.
+      def refund(n : Int) : Nil
+        @refund += n
       end
 
       # Hand the unsent part of the total back, for a process that is done sending.

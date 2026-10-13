@@ -957,12 +957,12 @@ module Gori
         end
       end
 
-      # One side's bytes before Match&Replace changed them (#1589): `request`/`response`, the head,
-      # and the body when a body rule changed it (nil = the stored body is the original).
+      # One side's bytes before Match&Replace or an Intercept edit changed them (#1589):
+      # `request`/`response`, the head, and the body when it changed (nil = the stored body is the original).
       alias Original = {String, Bytes, Bytes?}
 
-      # `request_original_head` / `response_original_body` …, present only for a side a rule
-      # changed, under the same header redaction as the stored heads above.
+      # `request_original_head` / `response_original_body` …, present only for a side a rule or an
+      # Intercept edit changed, under the same header redaction as the stored heads above.
       def self.emit_originals(j : JSON::Builder, originals : Array(Original), body_cap : Int32,
                               body_omit : Bool, include_sensitive : Bool) : Nil
         originals.each do |side, head, body|
@@ -1111,6 +1111,11 @@ module Gori
         end
       end
 
+      # Who wrote a WebSocket message, as `emit_body` labels a body (#1586).
+      def self.ws_origin(direction : String) : String
+        direction == "out" ? "client" : "target"
+      end
+
       # A WebSocket flow (status 101) carries a separate message log the heads/bodies
       # don't show. Mirror the `gori run show` WS pane, bounded for LLM use: text
       # frames inline their (clipped) payload, binary frames report a size only.
@@ -1136,6 +1141,7 @@ module Gori
                     j.field "direction", m.direction
                     j.field "opcode", m.opcode
                     j.field "type", ws_frame_type(m.opcode)
+                    j.field "origin", ws_origin(m.direction)
                     j.field "at", m.created_at
                     j.field "at_iso", Gori.iso_micros(m.created_at)
                     # The V7 shape (FIN / RSV / masked / frame count) and a CLOSE's code and
@@ -1230,6 +1236,7 @@ module Gori
                     j.field "type", text(e.type)
                     j.field "id", text(e.id)
                     j.field "retry", e.retry
+                    j.field "origin", "target" # the response's events, as `emit_body` labels it (#1586)
                     data = e.data.scrub
                     cut = data.size > SSE_DATA_MAX
                     j.field "data", cut ? data[0, SSE_DATA_MAX] : data

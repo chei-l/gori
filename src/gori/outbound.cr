@@ -72,8 +72,13 @@ module Gori
     # (a cap stop is not a `@blocked` payload unit — see `Fuzz::Engine#run_one`), so the cap
     # question stays with the callers that ask it.
     def self.permanent_refusal?(err : String?) : Bool
-      err == SANDBOX_SWEEP_ERROR || err == EXCLUDE_SWEEP_ERROR ||
-        err == BUDGET_SPENT_ERROR || err == BUDGET_STOPPED_ERROR || err == BUDGET_UNAVAILABLE_ERROR
+      return false unless err
+      err == SANDBOX_SWEEP_ERROR || err == EXCLUDE_SWEEP_ERROR || budget_refusal?(err)
+    end
+
+    # A refusal from the project request budget (#1601): it holds for every later send too.
+    def self.budget_refusal?(err : String) : Bool
+      err == BUDGET_SPENT_ERROR || err == BUDGET_STOPPED_ERROR || err == BUDGET_UNAVAILABLE_ERROR
     end
 
     # Which Layer-2 gate a `sweep_block` refusal came from, as a `scope_decision` names it.
@@ -194,6 +199,13 @@ module Gori
     # an excluded target, which no waiver lifts, the operator is the only fix offered.
     def self.remedy(verdict : Verdict, waiver : String?, *, add_include : Bool = true,
                     edit_exclude : Bool = true) : String
+      # An approval refusal (#1585) is lifted by the operator's answer, not by a scope rule; only
+      # an agent's Outbound carries an Approval, so the card is raised by one call of its own.
+      if verdict.pending?
+        target = verdict.port ? "#{verdict.host}:#{verdict.port}" : verdict.host
+        return "gori's MCP permissions ask the operator before #{target} is reached: send one request there " \
+               "with send_request to raise the approval card (only an \"Always\" answer covers later calls)"
+      end
       if verdict.excluded?
         fix = "delete or narrow the scope EXCLUDE rule that matches it (an include rule cannot override an exclude)"
         return edit_exclude ? fix : "ask the operator to #{fix}"
@@ -212,6 +224,14 @@ module Gori
 
     def remedy(verdict : Verdict) : String
       Outbound.remedy(verdict, @waiver, add_include: @can_add_include, edit_exclude: @can_edit_exclude)
+    end
+
+    # "<host> is out of the project scope — <remedy>", the sentence a core engine reports a
+    # Layer-1 refusal in; a target in scope that only awaits the operator's approval is not
+    # called out of scope.
+    def refusal(verdict : Verdict) : String
+      what = verdict.pending == PENDING_SEND ? "awaits the operator's approval" : "is out of the project scope"
+      "#{verdict.host} #{what} — #{remedy(verdict)}"
     end
 
     getter scope : Scope?
@@ -392,16 +412,23 @@ module Gori
 
     # ── the project request budget ───────────────────────────────────────────────
 
+    # Hand back `n` slots `admit` gave that were never sent.
+    def refund(n : Int32) : Nil
+      @budget.try(&.refund(n))
+    end
+
     # Take `count` request slots from the project-wide budget (#1601), waiting for the rate, or
     # return the refusal. Asked once per REAL send, right after its Layer-2 gate passed, never
-    # by a preflight; proxied client traffic never reaches it. Nothing configured costs one
-    # throttled `refresh` and a nil check. `halt` defaults to the run's; a single send passes
-    # its own cancel.
+    # by a preflight; proxied client traffic never reaches it. Nothing configured costs the
+    # budget's throttled reload and a nil check. `halt` defaults to the run's; a single send
+    # passes its own cancel.
     def admit(count : Int32 = 1, halt : Proc(Bool)? = @halt) : String?
-      refresh
-      b = @budget
-      return nil unless b && b.configured?
-      count.times { (err = b.admit(halt)) && (return err) }
+      return nil unless b = @budget
+      count.times do |i|
+        next unless err = b.admit(halt)
+        b.refund(i) # the slots already taken go out with nothing: one refusal for the group
+        return err
+      end
       nil
     end
 
@@ -412,7 +439,6 @@ module Gori
     def close : Nil
       store = @owned_store
       @owned_store = nil
-      @budget.try(&.release) if store
       store.try(&.close)
     rescue
       # a close failure must never take down a run that already finished its work
@@ -532,7 +558,6 @@ module Gori
       return if now - @last_reload < RELOAD_INTERVAL
       @last_reload = now
       @scope.try(&.reload)
-      @budget.try(&.reload)
     rescue
       # keep the last-known scope on a reload failure
     end

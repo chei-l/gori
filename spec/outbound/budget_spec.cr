@@ -52,6 +52,30 @@ describe Gori::Outbound::Budget do
     end
   end
 
+  it "leases at most a quarter of what is left, so an idle process cannot hoard the total" do
+    with_two_stores do |store, peer|
+      set_budget(store, max: "8")
+      Budget.new(store).admit(nil).should be_nil # a lease of 2, one left unsent and never released
+      b = Budget.new(peer)
+      sent = 0
+      20.times { sent += 1 if b.admit(nil).nil? }
+      sent.should eq(6)
+    end
+  end
+
+  it "hands a lease back when its store closes, whoever closes it" do
+    path = File.tempname("gori-spec", ".db")
+    a = Gori::Store.open(path)
+    set_budget(a, max: "100")
+    Gori::Outbound.agent(Gori::Scope.load(a), false).admit.should be_nil # an MCP send, store not owned
+    spent(a).should eq(Budget::COUNT_LEASE.to_s)
+    a.close
+    b = Gori::Store.open(path)
+    spent(b).should eq("1")
+    b.close
+    delete_db_files(path)
+  end
+
   it "hands the unsent part of a lease back on release" do
     with_store do |store|
       set_budget(store, max: "100")
@@ -60,6 +84,19 @@ describe Gori::Outbound::Budget do
       spent(store).should eq(Budget::COUNT_LEASE.to_s) # one lease claimed
       a.release
       spent(store).should eq("3")
+    end
+  end
+
+  it "releases the lease a store's Outbounds took when that store is done" do
+    with_store do |store|
+      set_budget(store, max: "100")
+      Budget.release(store) # nothing built yet: no lease, no write
+      spent(store).should be_nil
+      2.times { Gori::Outbound.cli(Gori::Scope.load(store), true).admit.should be_nil }
+      Budget.release(store)
+      spent(store).should eq("2")
+      Budget.release(store) # forgotten: a second close hands nothing back twice
+      spent(store).should eq("2")
     end
   end
 
@@ -97,6 +134,32 @@ describe Gori::Outbound::Budget do
       Gori::Outbound.interactive(scope).admit.should be_nil
       Gori::Outbound.interactive(Gori::Scope.load(store)).admit.should eq(Gori::Outbound::BUDGET_SPENT_ERROR)
       ungated_outbound.admit.should be_nil # no project, no budget
+    end
+  end
+
+  # MCP and the TUI Repeater build a fresh Outbound per send, so the reload cannot ride on one.
+  it "sees a ceiling set, then cleared, mid-session through per-send Outbounds" do
+    with_store do |store|
+      Gori::Outbound.interactive(Gori::Scope.load(store)).admit.should be_nil
+      set_budget(store, max: "2")
+      sleep Gori::Outbound::RELOAD_INTERVAL + 100.milliseconds
+      sent = 0
+      5.times { sent += 1 if Gori::Outbound.interactive(Gori::Scope.load(store)).admit.nil? }
+      sent.should eq(2)
+      set_budget(store) # the operator unsets the total
+      sleep Gori::Outbound::RELOAD_INTERVAL + 100.milliseconds
+      Gori::Outbound.interactive(Gori::Scope.load(store)).admit.should be_nil
+    end
+  end
+
+  it "refunds the slots a multi-slot admit took before it was refused" do
+    with_store do |store|
+      set_budget(store, max: "10")
+      ob = Gori::Outbound.interactive(Gori::Scope.load(store))
+      7.times { ob.admit.should be_nil }
+      ob.admit(5).should eq(Gori::Outbound::BUDGET_SPENT_ERROR) # a 5-member race, 3 left
+      Budget.for(store).release
+      spent(store).should eq("7")
     end
   end
 

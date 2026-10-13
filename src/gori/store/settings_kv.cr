@@ -1,5 +1,6 @@
 require "db"
 require "json"
+require "../dial_address"
 
 module Gori
   class Store
@@ -64,6 +65,22 @@ module Gori
       set_setting(MCP_HOST_GRANTS_KEY, (grants << grant).to_json)
     end
 
+    # Drop every grant for `host` (bare or with any port), compared in `OverrideHost.key` form:
+    # a host override repointing that name means an approval given for it named a server it no
+    # longer dials.
+    def drop_mcp_host_grants(host : String) : Nil
+      key = OverrideHost.key(host)
+      grants = mcp_host_grants
+      kept = grants.reject { |g| OverrideHost.key(Store.grant_host(g)) == key }
+      set_setting(MCP_HOST_GRANTS_KEY, kept.to_json) unless kept.size == grants.size
+    end
+
+    # The host half of a grant: `host:port` loses its port, a bare host is itself.
+    def self.grant_host(grant : String) : String
+      host, sep, port = grant.rpartition(':')
+      !sep.empty? && !port.empty? && port.each_char.all?(&.ascii_number?) ? host : grant
+    end
+
     # The project-wide outbound request budget's shared rows (#1601), written only by
     # `lease_outbound_slots`: the next free rate slot (unix µs) and the requests counted against
     # `net.outbound_max_requests`.
@@ -103,7 +120,9 @@ module Gori
       row = read.call(OUTBOUND_BUDGET_NEXT_KEY)
       reach = now_us + OUTBOUND_LEASE_SPAN_US + {OUTBOUND_LEASE_SPAN_US, interval_us}.max
       at = interval_us > 0 && row <= reach ? {row, now_us}.max : now_us
-      grant = max ? {want.to_i64, max - spent}.min : want.to_i64
+      # A quarter of what is left at most: a lease a live process never sends (an idle TUI or
+      # MCP server holds one until it exits) must not lock every other process out of the total.
+      grant = max ? {want.to_i64, max - spent, {(max - spent) // 4, 1_i64}.max}.min : want.to_i64
       if grant <= 0
         grant = 0_i64
       elsif interval_us > 0 && at > now_us + OUTBOUND_LEASE_SPAN_US

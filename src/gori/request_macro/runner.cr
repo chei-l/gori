@@ -52,6 +52,16 @@ module Gori::RequestMacro
     @labels : Array(String)
     @sink : Store
 
+    # A step host the operator's approval would let through (#1585): a surface that can raise
+    # the approval card (MCP's `fuzz_start` / `mine_start`) answers with it instead of the text.
+    class ApprovalPending < Error
+      getter verdict : Outbound::Verdict
+
+      def initialize(message : String, @verdict : Outbound::Verdict)
+        super(message)
+      end
+    end
+
     # Build and VALIDATE the runner for `spec`, reading the sessions out of `store`. Raises
     # `Error` naming the step — never returns a runner that would fail on its first use for a
     # reason that was knowable up front.
@@ -81,8 +91,8 @@ module Gori::RequestMacro
         end
         verdict = outbound.check_request(plan.scheme, plan.host, Outbound.request_target(plan.bytes), plan.port)
         if verdict.blocked?
-          raise Error.new("macro step #{n} (#{step.label}) targets #{plan.host}, which is out of the project scope — " \
-                          "#{outbound.remedy(verdict)}")
+          msg = "macro step #{n} (#{step.label}): #{outbound.refusal(verdict)}"
+          raise verdict.pending? ? ApprovalPending.new(msg, verdict) : Error.new(msg)
         end
       end
       runner = new(spec, steps, outbound, store, overrides, verify)
@@ -250,7 +260,7 @@ module Gori::RequestMacro
         verdict = @outbound.check_request(plan.scheme, plan.host, target, plan.port)
         if verdict.blocked?
           return failed(total, sent, n, step.label,
-            "#{plan.host} is out of the project scope — #{@outbound.remedy(verdict)}", nil, flows)
+            @outbound.refusal(verdict), nil, flows)
         end
         wire = plan.wire_bytes
         # Layer 2 on the bytes that will go out (a `$BIND` in the request line resolves before

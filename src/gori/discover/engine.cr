@@ -34,6 +34,10 @@ module Gori::Discover
     def admit : String?
       nil
     end
+
+    # Hand back `n` admitted slots that were never sent.
+    def refund(n : Int32) : Nil
+    end
   end
 
   # Default policy (specs / unconfigured scope): nothing blocked, no include boundary.
@@ -2128,6 +2132,8 @@ module Gori::Discover
 
     # One wire send after its rate slot, or a STOPPED answer when a stop ended the wait.
     private def paced_fetch(p : Url::Parts, target : String, interval : Time::Span?) : Repeater::Result
+      # Past the run's own cap the send is refused anyway: answer before taking a budget slot.
+      return @capped.fetch(p.scheme, p.host, p.port, target) if @capped.cap_reached?
       return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, STOPPED) unless pace(interval)
       if err = @scope.admit
         return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, STOPPED) if stopped?
@@ -2136,6 +2142,8 @@ module Gori::Discover
         @budget_refusal = err
         return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, err)
       end
+      # Another worker may have reached the cap while this one waited for its slot.
+      @scope.refund(1) if @capped.cap_reached?
       @capped.fetch(p.scheme, p.host, p.port, target)
     end
 

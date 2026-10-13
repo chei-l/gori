@@ -28,10 +28,13 @@ module Gori
     # must hand it over or the `graphql` key is absent for every WebSocket flow, which reads as
     # "this socket carries no GraphQL". nil (an HTTP flow, or a caller with no transcript to
     # give) simply contributes nothing.
+    #
+    # `paired: false` (a side excluded) skips `json_rpc` / `llm`: they pair a request with its
+    # reply, and half a flow would read as an unanswered call.
     def emit_json(j : JSON::Builder, *, target : String,
                   req_head : Bytes?, req_body : Bytes?,
                   resp_head : Bytes?, resp_body : Bytes?, clip : Int32? = nil,
-                  ws_messages : Array(Store::WsMessage)? = nil) : Nil
+                  ws_messages : Array(Store::WsMessage)? = nil, paired : Bool = true) : Nil
       if doc = Saml.from_flow(target, req_head, req_body, resp_head, resp_body)
         j.field "saml" do
           j.object do
@@ -88,8 +91,10 @@ module Gori
       end
       emit_ws_graphql(j, ws_ops, clip)
       emit_ws_proto(j, ws_frames, clip)
-      JsonRpc.from_flow(req_head, req_body, resp_head, resp_body).try { |ex| emit_json_rpc(j, ex, clip) }
-      LlmCall.from_flow(req_head, req_body, resp_head, resp_body).try { |call| emit_llm(j, call, clip) }
+      if paired
+        JsonRpc.from_flow(req_head, req_body, resp_head, resp_body).try { |ex| emit_json_rpc(j, ex, clip) }
+        LlmCall.from_flow(req_head, req_body, resp_head, resp_body).try { |call| emit_llm(j, call, clip) }
+      end
       if fields = FormData.from_flow(target, req_head, req_body)
         j.field "form_params" do
           j.array do
@@ -151,9 +156,9 @@ module Gori
                   j.field "method", c.method
                   j.field "id", c.id
                   j.field "label", c.label
-                  emit_text(j, "params", c.params, clip)
+                  emit_text(j, "params", c.params, clip, "client")
                   j.field "reply_kind", c.reply ? (c.error ? "error" : "result") : nil
-                  emit_text(j, "reply", c.reply, clip)
+                  emit_text(j, "reply", c.reply, clip, "target")
                 end
               end
             end
@@ -165,7 +170,7 @@ module Gori
                 j.object do
                   j.field "method", m.method
                   j.field "id", m.id
-                  emit_text(j, "message", m.body, clip)
+                  emit_text(j, "message", m.body, clip, "target")
                 end
               end
             end
@@ -183,13 +188,13 @@ module Gori
           j.field "messages", c.roles
           j.field "tools", c.tools
           j.field "streamed", c.streamed
-          emit_text(j, "text", c.text, clip)
+          emit_text(j, "text", c.text, clip, "target")
           j.field "tool_calls" do
             j.array do
               c.tool_calls.each do |t|
                 j.object do
                   j.field "name", t.name
-                  emit_text(j, "arguments", t.arguments, clip)
+                  emit_text(j, "arguments", t.arguments, clip, "target")
                 end
               end
             end
@@ -289,8 +294,10 @@ module Gori
     end
 
     # Emit a (possibly nil) text field, clipped to `clip` bytes when set; a clip flags
-    # `<name>_truncated` so the value isn't read as whole.
-    private def emit_text(j : JSON::Builder, name : String, text : String?, clip : Int32?) : Nil
+    # `<name>_truncated` so the value isn't read as whole. `origin` labels who wrote a present
+    # value as `<name>_origin` (`target` or `client`, as MCP's body objects do, #1586).
+    private def emit_text(j : JSON::Builder, name : String, text : String?, clip : Int32?, origin : String? = nil) : Nil
+      j.field "#{name}_origin", origin if origin && text
       if text.nil?
         j.field name, nil
       elsif clip && text.bytesize > clip
