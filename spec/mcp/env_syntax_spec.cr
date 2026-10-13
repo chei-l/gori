@@ -51,8 +51,15 @@ describe "MCP list_env grammar report" do
         generators = got["generators"].as_a
         generators.map(&.["name"].as_s).should eq(
           ["UUID", "RANDOM", "RANDOM_HEX", "TIMESTAMP", "TIMESTAMP_MS", "ISO8601", "USER_AGENT",
-           "USER_AGENT_CHROME", "USER_AGENT_FIREFOX", "USER_AGENT_SAFARI"])
+           "USER_AGENT_CHROME", "USER_AGENT_FIREFOX", "USER_AGENT_SAFARI", "TOTP"])
         generators.map(&.["token"].as_s).should contain("$GEN.UUID")
+        # #1591: an agent learns that TOTP cannot mint before a send is refused, and why.
+        generators.find! { |row| row["name"].as_s == "TOTP" }["unavailable"].as_s
+          .should eq("env var TOTP_SECRET is not set")
+        generators.find! { |row| row["name"].as_s == "UUID" }["unavailable"]?.should be_nil
+        mcp_ok_json(tools_for(store), "set_env_var", %({"key":"TOTP_SECRET","value":"GEZDGNBVGY3TQOJQ"}))
+        env_result(store)["generators"].as_a.find! { |row| row["name"].as_s == "TOTP" }["unavailable"]?
+          .should be_nil
         generators.find! { |row| row["name"].as_s == "RANDOM_HEX" }["description"].as_s
           .should contain("128-bit hex")
         got["user_agents"]["source"].as_s.should eq("built-in")
@@ -121,6 +128,19 @@ describe "MCP list_env grammar report" do
     end
   end
 
+  # #1591: the agent mints with `$GEN.TOTP` and never needs the seed, so asking does not hand it over.
+  it "withholds TOTP_SECRET even when asked for the secrets" do
+    with_store_env do |store|
+      seed = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+      mcp_ok_json(tools_for(store), "set_env_var", %({"key":"TOTP_SECRET","value":"#{seed}"}))
+      mcp_ok_json(tools_for(store), "set_env_var", %({"key":"OTHER","value":"shown"}))
+      got = env_result(store, %({"include_sensitive":true}))
+      got.to_json.should_not contain(seed)
+      got["vars"].as_a.to_h { |row| {row["key"].as_s, row["value"].as_s} }
+        .should eq({"TOTP_SECRET" => "[REDACTED]", "OTHER" => "shown"})
+    end
+  end
+
   # The refusal every tool shares when a token resolves to nothing has to name the remedy for THE
   # NAMESPACE it is about. `set_env_var` is the remedy for an env var; a BIND name has no setter at
   # all — it is bound at send time from a response — so telling an agent to `set_env_var` it made it
@@ -167,6 +187,18 @@ describe "MCP list_env grammar report" do
           msg.should contain("is a generator")
           msg.should contain("before the request is framed")
           msg.should_not contain("list_env.generators")
+        end
+      end
+    end
+
+    it "refuses send_request before dialing when its $GEN.TOTP cannot mint" do
+      with_store_env do |store|
+        with_env_syntax(Gori::Env::Syntax::Namespaced) do
+          raw = "POST /login HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nX-OTP: $GEN.TOTP\\r\\n\\r\\n"
+          r = tools_for(store).call("send_request", JSON.parse(
+            %({"url":"http://127.0.0.1:1/","raw":"#{raw}","allow_unscoped":true})))
+          r.is_error.should be_true
+          r.text.should contain("$GEN.TOTP cannot mint: env var TOTP_SECRET is not set")
         end
       end
     end

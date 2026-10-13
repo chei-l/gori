@@ -29,11 +29,14 @@ module Gori
               j.array do
                 if Settings.env_syntax.namespaced?
                   Env::GENERATOR_HINTS.each do |name, description|
-                    {
-                      name:        name,
-                      token:       Env.spell(name, Env::Namespace::Gen),
-                      description: description,
-                    }.to_json(j)
+                    j.object do
+                      j.field "name", name
+                      j.field "token", Env.spell(name, Env::Namespace::Gen)
+                      j.field "description", description
+                      # Why it cannot mint now (`$GEN.TOTP` with no secret), so an agent learns
+                      # before a send is refused. Never the secret: the reason only names the var.
+                      Env.generator_refusal(name).try { |why| j.field "unavailable", why }
+                    end
                   end
                 end
               end
@@ -52,7 +55,9 @@ module Gori
         Settings.project_env_vars.each do |(key, val)|
           j.object do
             j.field "key", key
-            j.field "value", include_sensitive ? val : "[REDACTED]"
+            # `$GEN.TOTP`'s seed stays withheld even then (#1591): it is a long-lived second
+            # factor, and the generator mints from it without the agent ever holding it.
+            j.field "value", include_sensitive && key != Env::TOTP_SECRET_VAR ? val : "[REDACTED]"
             # Two facts about the value that are not the value.
             #
             # `[REDACTED]` alone leaves one question a caller cannot answer without asking
@@ -119,7 +124,8 @@ module Gori
           "List the project's env vars, substituted into outbound requests (send_request/" \
           "send_websocket). Result: {syntax, prefix, example, vars:[…], generators:[…], " \
           "user_agents:{source, count}}. " \
-          "Each generator row has its name, complete token and output format; generators are " \
+          "Each generator row has its name, complete token, output format and, when it cannot " \
+          "mint now, 'unavailable' (why); generators are " \
           "available under namespaced syntax and mint a fresh value per request; 'user_agents' says " \
           "whether the USER_AGENT generators draw from the operator's settings list or the " \
           "built-in one. 'syntax' is THIS " \
@@ -129,12 +135,12 @@ module Gori
           "'prefix' is the sigil, configurable in both; 'example' is the two applied, so a " \
           "non-default sigil needs no assembling. Values are [REDACTED] by default (a project " \
           "env var is exactly the kind of place a credential/token lives); pass " \
-          "include_sensitive:true to see them. Each var also carries 'length' and, when the " \
+          "include_sensitive:true to see them (TOTP_SECRET stays redacted). Each var also carries 'length' and, when the " \
           "value already begins with one, 'scheme' (Bearer/Basic/…) — enough to tell whether a " \
           "header should read \"Bearer <token>\" or just the token, without the value. To see " \
           "which key a saved request is actually wired to, read " \
           "get_repeater_context{include_content:true}'s env_headers." do |s|
-          s.field "include_sensitive", boolprop("return actual values instead of [REDACTED] (default false)")
+          s.field "include_sensitive", boolprop("return actual values instead of [REDACTED], except TOTP_SECRET (default false)")
         end
 
         return unless @allow_actions

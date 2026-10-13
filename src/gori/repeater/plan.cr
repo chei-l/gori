@@ -50,6 +50,16 @@ module Gori::Repeater
     def initialize(@reason : Reason, message : String, @detail : String? = nil)
       super(message)
     end
+
+    # The sentence when `Plan.build` refused a `$GEN` token that cannot mint (#1591), or nil.
+    # Told apart from a dial value's unresolved `$GEN` by the message rather than a new
+    # `Reason`, which every surface `case`s exhaustively: a token in a target or SNI is refused
+    # by position, and "set TOTP_SECRET" would not fix it.
+    def mint_refusal : String?
+      return nil unless reason.unresolved_env?
+      sentence = Env.mint_refusal(detail)
+      sentence == message ? sentence : nil
+    end
   end
 
   # A pre-resolved dial origin, for a surface that already parsed and validated one.
@@ -538,6 +548,12 @@ module Gori::Repeater
         evidence_literals: options.evidence_literals,
         reframe_grpc: options.reframe_grpc?, tls_preset: tls_preset,
         refresh_slot: options.refresh_slot, refresh_layer: options.refresh_layer)
+      # Unlike an unset `$NAME`, a registered `$GEN` token is unambiguously a reference, so one
+      # that cannot mint (`$GEN.TOTP` with no secret, #1591) is refused here rather than sent
+      # as text the origin would only answer with a failed login.
+      if (token = sender.unmintable(wires)) && (why = Env.mint_refusal(token))
+        raise PlanError.new(PlanError::Reason::UnresolvedEnv, why, token)
+      end
       new(sender: sender, requests: wires, scheme: scheme, host: host, port: port,
         http2: options.http2?, websocket: websocket, sni: sni,
         preserve_field_case: options.preserve_field_case?,
