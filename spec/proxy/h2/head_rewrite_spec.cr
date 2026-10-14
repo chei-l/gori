@@ -344,6 +344,23 @@ describe Gori::Proxy::H2::HeadRewrite do
       .find { |(n, _)| n == "content-length" }.not_nil![1].should eq("5")
   end
 
+  it "does not record a rule whose content-length change was restored, beside one that went out (#1589)" do
+    with_store do |store|
+      rules = Gori::Rules.new(store, store.match_rules)
+      rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head, "Content-Length", "999",
+        Gori::Store::RuleOp::SetHeader)
+      rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head, "X-B", "1",
+        Gori::Store::RuleOp::AddHeader)
+      _, added = rules.rules
+      pipe, assembler, sink = pipeline(rules)
+      block = HPACK::Encoder.new.encode(req("/x") + [{"content-length", "5"}])
+      sent = HPACK::Decoder.new.decode(push(pipe, assembler, headers(1_u32, block)).first.payload)
+      sent.should contain({"content-length", "5"})
+      sent.should contain({"x-b", "1"})
+      sink.requests.first.rewrite.not_nil!.hits.should eq([Gori::Store::RuleRef.new(added.scope, added.id)])
+    end
+  end
+
   it "rewrites a response head and leaves the request direction alone" do
     pipe, assembler, _ = pipeline(SubRewriter.new("HTTP/2 200", "HTTP/2 503"), direction: "in")
     block = HPACK::Encoder.new.encode([{":status", "200"}, {"content-type", "text/html"}])
@@ -351,6 +368,19 @@ describe Gori::Proxy::H2::HeadRewrite do
     pipe.accept(headers(1_u32, block)) { |f, pre| emitted << f; assembler.feed("in", f, pre) }
     HPACK::Decoder.new.decode(emitted.first.payload)
       .find { |(n, _)| n == ":status" }.not_nil![1].should eq("503")
+  end
+
+  it "never rewrites an interim 1xx head, as HTTP/1.1 does not" do
+    pipe, assembler, _ = pipeline(SubRewriter.new("a.css", "evil.css"), direction: "in")
+    sender = HPACK::Encoder.new
+    hints = sender.encode([{":status", "103"}, {"link", "</a.css>; rel=preload"}])
+    final = sender.encode([{":status", "200"}, {"link", "</a.css>; rel=preload"}])
+    emitted = [] of Frame::Header
+    pipe.accept(headers(1_u32, hints, Frame::END_HEADERS)) { |f, pre| emitted << f; assembler.feed("in", f, pre) }
+    emitted.first.payload.should eq(hints)
+    pipe.engaged?.should be_false
+    pipe.accept(headers(1_u32, final)) { |f, pre| emitted << f; assembler.feed("in", f, pre) }
+    HPACK::Decoder.new.decode(emitted.last.payload).should contain({"link", "</evil.css>; rel=preload"})
   end
 
   it "scopes a coalesced response rewrite to that stream's request authority" do
@@ -433,6 +463,29 @@ describe Gori::Proxy::H2::HeadRewrite do
   end
 
   describe "the h3 Alt-Svc strip (settings network.strip_alt_svc)" do
+    it "keeps the origin's head, Alt-Svc included, as a rule's original — as HTTP/1.1 does (#1589)" do
+      before = Gori::Settings.strip_alt_svc?
+      begin
+        Gori::Settings.strip_alt_svc = true
+        with_store do |store|
+          rules = Gori::Rules.new(store, store.match_rules)
+          rules.add(Gori::Store::RuleTarget::Response, Gori::Store::RulePart::Head, "X-B", "1",
+            Gori::Store::RuleOp::AddHeader)
+          pipe, assembler, sink = pipeline(rules, direction: "in")
+          assembler.feed("out", headers(1_u32, HPACK::Encoder.new.encode(req("/a"))))
+          block = HPACK::Encoder.new.encode([{":status", "200"}, {"alt-svc", %(h3=":443")}])
+          emitted = [] of Frame::Header
+          pipe.accept(headers(1_u32, block)) { |f, pre| emitted << f; assembler.feed("in", f, pre) }
+          HPACK::Decoder.new.decode(emitted.first.payload).should eq([{":status", "200"}, {"x-b", "1"}])
+          resp = sink.responses.first
+          String.new(resp.rewrite.not_nil!.head.not_nil!).should contain(%(alt-svc: h3=":443"))
+          String.new(resp.head).should_not contain("alt-svc")
+        end
+      ensure
+        Gori::Settings.strip_alt_svc = before
+      end
+    end
+
     it "removes it from what the client receives, and re-encodes the block to do it" do
       with_strip(%(h3=":443"; ma=86400), on: true) do |pipe, emitted, _, sink|
         peer = HPACK::Decoder.new.decode(emitted.first.payload)

@@ -722,6 +722,11 @@ module Gori
             "host_overrides"     => %w[id host ip],
             "oast_providers"     => %w[id created_at updated_at name kind host token enabled position],
             "oast_sessions"      => %w[id created_at provider_id kind server_url correlation_id secret private_key_pem token last_poll_at provider_key],
+            # Flow reads, deletes and clears touch these: one missing raises "no such table" there.
+            "intercept_originals" => %w[flow_id request],
+            "flow_interims"       => %w[flow_id seq status head relayed omitted],
+            "flow_rule_hits"      => %w[flow_id side scope rule_id],
+            "rewrite_originals"   => %w[flow_id side head body],
           })
       end
 
@@ -875,6 +880,13 @@ module Gori
               disable_slot_auto_refresh(conn)
             end
             conn.exec("DELETE FROM host_overrides") if table_exists?(conn, "host_overrides")
+            # A global rule's id was numbered by the exporting install, like GLOBAL_OVERRIDE_KEYS:
+            # here it would name whatever local global rule holds that id. No install issues id 0
+            # and `RuleRef.parse?` refuses it, so the flow still reads as rewritten (ORIGINAL kept)
+            # but names no rule.
+            if table_exists?(conn, "flow_rule_hits")
+              conn.exec("UPDATE OR REPLACE flow_rule_hits SET rule_id = 0 WHERE lower(scope) = 'global'")
+            end
             if table_exists?(conn, "match_rules")
               conn.exec("UPDATE match_rules SET enabled = 0 WHERE lower(op) = 'pipe'")
               if table_columns(conn, "match_rules").includes?("body_file")

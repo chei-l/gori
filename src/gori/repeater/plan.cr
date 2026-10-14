@@ -331,6 +331,9 @@ module Gori::Repeater
     # It is only meaningful on an https target — a plaintext leg has no ClientHello.
     getter tls_preset : String?
 
+    # What `apply_rules` changed (`RequestRules.apply`), for the History row's rule provenance.
+    property rewrite : Store::Rewrite? = nil
+
     def initialize(@sender : Sender, @requests : Array(Bytes), @scheme : String,
                    @host : String, @port : Int32, @http2 : Bool,
                    @websocket : Bool, @sni : String?, @preserve_field_case : Bool = false,
@@ -376,13 +379,19 @@ module Gori::Repeater
     end
 
     # Send bytes already taken from `wire_bytes`. Field-native ignores them, for the reason
-    # `wire_bytes` states.
-    def send_wire(wire : Bytes, cancel : Proc(Bool)? = nil) : Result
+    # `wire_bytes` states. `admitted`: the caller took the budget slot first (`admit`).
+    def send_wire(wire : Bytes, cancel : Proc(Bool)? = nil, admitted : Bool = false) : Result
       if fields = @h2_fields
-        @sender.send_fields(fields, @h2_body, cancel)
+        @sender.send_fields(fields, @h2_body, cancel, admitted)
       else
-        @sender.send_wire(wire, cancel)
+        @sender.send_wire(wire, cancel, admitted)
       end
+    end
+
+    # This send's project-budget slot, taken BEFORE `wire_bytes` so a wait for the rate cannot
+    # age what the wire pass mints (`Sender#admit`). Then `send_wire(…, admitted: true)`.
+    def admit(cancel : Proc(Bool)? = nil) : String?
+      @sender.admit(cancel: cancel)
     end
 
     def send_group : Array(Result)

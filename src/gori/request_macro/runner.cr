@@ -262,18 +262,15 @@ module Gori::RequestMacro
           return failed(total, sent, n, step.label,
             @outbound.refusal(verdict), nil, flows)
         end
-        wire = plan.wire_bytes
-        # Layer 2 on the bytes that will go out (a `$BIND` in the request line resolves before
-        # the socket), keyed on the host actually dialled.
-        if reason = @outbound.sweep_block(plan.scheme, plan.host, Outbound.request_target(wire), plan.port)
-          return failed(total, sent, n, step.label, reason, nil, flows)
-        end
+        wire = admitted_wire(plan, cancelled)
+        return failed(total, sent, n, step.label, wire, nil, flows) if wire.is_a?(String)
         if budget && !budget.reserve(1_i64)
+          @outbound.refund(1)
           return Outcome.new(false, total, sent, n, step.label, nil, BUDGET_ERROR, [] of String, flows,
             budget_exhausted: true)
         end
         sent_at = Time.utc.to_unix_ms * 1000_i64
-        result = plan.send_wire(wire)
+        result = plan.send_wire(wire, admitted: true)
         sent += 1
         record(plan, result, sent_at, wire, n).try { |fid| flows << fid }
         if err = result.error
@@ -286,6 +283,23 @@ module Gori::RequestMacro
         end
       end
       settle(bindings, before, total, sent, flows)
+    end
+
+    # The step's wire bytes after its project-budget slot, or the refusal. The slot comes first,
+    # so a login's `$GEN.TOTP` is minted after any wait for the rate; a refusal past it hands
+    # the slot back.
+    private def admitted_wire(plan : Repeater::Plan, cancelled : Proc(Bool)?) : Bytes | String
+      if reason = plan.admit(cancelled)
+        return reason
+      end
+      wire = plan.wire_bytes
+      # Layer 2 on the bytes that will go out (a `$BIND` in the request line resolves before
+      # the socket), keyed on the host actually dialled.
+      if reason = @outbound.sweep_block(plan.scheme, plan.host, Outbound.request_target(wire), plan.port)
+        @outbound.refund(1)
+        return reason
+      end
+      wire
     end
 
     # The steps all answered. Did they refresh anything?

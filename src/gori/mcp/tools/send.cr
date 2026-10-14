@@ -101,12 +101,20 @@ module Gori
         # flow and `effective_request` — this tool's "what actually went out" — described a
         # request without the identity the socket carried. Sent through `send_wire`, so the
         # bytes reported and the bytes written are the same slice.
+        #
+        # The project budget's slot first (#1601): a wait for the rate must not age what the wire
+        # pass mints (a `$GEN.TOTP`), and a send the budget refuses never left gori, so it gets
+        # no History row. Every return below that does not send hands the slot back.
+        if reason = plan.admit(cancel_signal)
+          return err("request cancelled", "CANCELLED") if cancelled?
+          return err(reason, "BUDGET_EXHAUSTED")
+        end
         h1_wire = plan.wire_bytes
         wire = wire_request(plan, built, h1_wire)
         recorded_flow_id = nil.as(Int64?)
         if record_history
           id = record_outbound_request(built, wire, http2, plan.h2_fields,
-            source_ref: send_seed_ref(h))
+            source_ref: send_seed_ref(h), rewrite: plan.rewrite)
           # BEFORE the send, and it stays that way: `record_history` defaults to true and is an
           # audit promise, so a row that cannot be written means this request must not go out
           # unaudited. `insert_flow` answers 0 rather than blocking when it loses SQLite's single
@@ -114,14 +122,20 @@ module Gori
           # retryable is what an agent's error policy can act on. It used to raise `Gori::Error`,
           # which the rescue below coded INVALID_ARGUMENT: "fix your arguments" for a call whose
           # arguments were fine, so the agent rewrote a correct request instead of retrying it.
-          return busy("could not record this request in History — the project's writer is busy " \
-                      "(a gori capturing beside this server holds SQLite's single writer slot). " \
-                      "NOTHING was sent. Retry in a moment, or pass record_history=false only if " \
-                      "an unaudited send is intentional.") if id <= 0
+          if id <= 0
+            ob.refund(1)
+            return busy("could not record this request in History — the project's writer is busy " \
+                        "(a gori capturing beside this server holds SQLite's single writer slot). " \
+                        "NOTHING was sent. Retry in a moment, or pass record_history=false only if " \
+                        "an unaudited send is intentional.")
+          end
           recorded_flow_id = id
         end
-        return err("request cancelled", "CANCELLED") if cancelled?
-        result = plan.send_wire(h1_wire, cancel_signal)
+        if cancelled?
+          ob.refund(1)
+          return err("request cancelled", "CANCELLED")
+        end
+        result = plan.send_wire(h1_wire, cancel_signal, admitted: true)
         return err("request cancelled", "CANCELLED") if cancelled?
         # The active session slot's `$NAME` that `plan.wire_bytes` shipped LITERALLY, drained
         # here because this tool IS the run summary for a synchronous send. Without it the only
@@ -189,6 +203,7 @@ module Gori
         insecure = bool_arg(h, "insecure", false)
         timeout = fuzz_timeout(h)
         ob = outbound(bool_arg(h, "allow_unscoped", false))
+        ob.halt = cancel_signal # a cancel also ends a wait for the project budget
 
         built = build_race_plan(members, force_http2, insecure, verbatim, timeout, store, ob)
         return built if built.is_a?(Result)
@@ -837,7 +852,8 @@ module Gori
 
       private def record_outbound_request(built : RequestBuilder::Built, wire : Bytes, http2 : Bool,
                                           h2_fields : Array({String, String})? = nil,
-                                          source_ref : String? = nil) : Int64
+                                          source_ref : String? = nil,
+                                          rewrite : Store::Rewrite? = nil) : Int64
         head, body = split_wire_request(Repeater::SendPersistence.replayable_request(
           h2_fields, built.host, built.port, wire))
         # Field-native: `head` is the h1 PROJECTION, not the pseudo-explicit dump, so the
@@ -873,6 +889,7 @@ module Gori
           source_surface: Gori::FlowSource::Surface::Mcp,
           source_ref: source_ref,
         )
+        captured.rewrite = rewrite
         # 0 (or less) means the row did NOT commit — the caller turns that into PROJECT_BUSY and
         # refuses the send. Answered rather than raised: `send_request`'s `Gori::Error` rescue is
         # for genuine argument mistakes, and a held writer is not one of those.

@@ -593,6 +593,35 @@ describe Gori::Rules do
         rules.preview(replace).matched.should eq(1)
       end
     end
+
+    # The proxy de-chunks before a body rule and refuses a compressed body; the preview read
+    # the stored wire form, so a json op never matched a chunked body the proxy did edit.
+    it "previews a body rule against the entity the proxy rewrites" do
+      with_store do |store|
+        add = ->(head : String, body : String) do
+          id = store.insert_flow(Gori::Store::CapturedRequest.new(
+            created_at: 1_000_i64, scheme: "http", host: "acme.test", port: 80,
+            method: "GET", target: "/x", http_version: "HTTP/1.1",
+            head: "GET /x HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice, source: Gori::FlowSource::Kind::Proxy))
+          store.update_response(Gori::Store::CapturedResponse.new(flow_id: id, status: 200,
+            head: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n#{head}\r\n".to_slice, body: body.to_slice))
+        end
+        add.call("Transfer-Encoding: chunked\r\n", "E\r\n{\"role\":\"usr\"}\r\n0\r\n\r\n")
+        add.call("Content-Encoding: gzip\r\n", %({"role":"usr"}))
+        add.call("", %({"role":"usr","pad":"#{"x" * Gori::Rules::RULE_PREVIEW_BODY_MAX}"}))
+        store.flush
+
+        rules = Gori::Rules.load(store)
+        json = Gori::Store::MatchRule.new(0_i64, true, Gori::Store::RuleTarget::Response,
+          Gori::Store::RulePart::Body, "role", %("admin"), Gori::Store::RuleOp::JsonSet)
+        pv = rules.preview(json)
+        {pv.scanned, pv.matched}.should eq({2, 1}) # the cut body is left out, not a miss
+        literal = Gori::Store::MatchRule.new(0_i64, true, Gori::Store::RuleTarget::Response,
+          Gori::Store::RulePart::Body, "usr", "admin")
+        pv = rules.preview(literal)
+        {pv.scanned, pv.matched}.should eq({3, 2}) # not the gzip one
+      end
+    end
   end
 
   # --- scope: the global library + this project's overrides ------------------------------
@@ -862,6 +891,29 @@ describe Gori::Rules do
         rules.rewrite_response_body(body, "acme.test", hits).should eq(body)
         rules.rewrite_request(body, "acme.test", hits) # no request rule: the lock-free fast path
         hits.should be_empty
+      end
+    end
+
+    it "settles the hits on the rules whose change survives into what was sent" do
+      with_store do |store|
+        rules = Gori::Rules.new(store, store.match_rules)
+        rules.add(Gori::Store::RuleTarget::Response, Gori::Store::RulePart::Body, "a", "b")
+        rules.add(Gori::Store::RuleTarget::Response, Gori::Store::RulePart::Body, "b", "a") # undoes the first
+        rules.add(Gori::Store::RuleTarget::Response, Gori::Store::RulePart::Body, "x", "y")
+        _, _, kept = rules.rules
+        hits = [] of Gori::Store::RuleRef
+        body = "a x".to_slice
+        sent = rules.rewrite_response_body(body, "acme.test", hits)
+        String.new(sent).should eq("a y")
+        hits.size.should eq(3)
+        rules.settle_hits(hits, 0, body, sent) { |b| b }
+        hits.should eq([Gori::Store::RuleRef.new(kept.scope, kept.id)])
+
+        # Every change cancelled out: nothing is left to name.
+        cancelled = [] of Gori::Store::RuleRef
+        rules.rewrite_response_body("a".to_slice, "acme.test", cancelled).should eq("a".to_slice)
+        rules.settle_hits(cancelled, 0, "a".to_slice, "a".to_slice) { |b| b }
+        cancelled.should be_empty
       end
     end
 

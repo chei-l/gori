@@ -64,6 +64,12 @@ module Gori
         sweep || plan.refusal
       end
 
+      # Layer 2, then the project budget's slot, taken here — before the wire pass, so a wait
+      # cannot age a `$GEN` mint. Its refusal is gori declining to send too: blocked, no History row.
+      private def send_refusal(plan : Repeater::Plan, target : String) : String?
+        layer_two_refusal(plan, target) || plan.admit
+      end
+
       def send(p : Planned) : Observation
         rec = p.step.detached? ? nil : @store.get_repeater(p.step.ref_id)
         # Re-read, because `Retest.plan` ran before the confirm and a peer may have closed the
@@ -101,7 +107,7 @@ module Gori
         if verdict.blocked?
           return Observation.new(blocked_reason: Retest.clip(@outbound.refusal(verdict)))
         end
-        if reason = layer_two_refusal(plan, target)
+        if reason = send_refusal(plan, target)
           return Observation.new(blocked_reason: Retest.clip(reason))
         end
         # A WebSocket handshake step is sent as an ORDINARY HTTP request and its 101/4xx is
@@ -113,7 +119,7 @@ module Gori
         note = plan.websocket? ? "handshake sent as HTTP — a retest step does not exchange frames" : nil
         sent_at = Time.utc.to_unix_ms * 1000_i64
         wire = plan.wire_bytes
-        result = plan.send_wire(wire)
+        result = plan.send_wire(wire, admitted: true)
         flow_id, record_note = record(plan, result, sent_at, wire, p)
         note = [note, record_note].compact.join(" · ").presence
         head = result.head.empty? ? nil : result.head
@@ -134,6 +140,11 @@ module Gori
 
       def finish : Nil
         @outbound.close if @close_outbound
+      end
+
+      # The run's stop also ends a wait for the project budget's slot.
+      def halt=(stop : Proc(Bool)?) : Nil
+        @outbound.halt = stop
       end
 
       # The History row for this send, and the note to put on the result row when there is

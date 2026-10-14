@@ -243,7 +243,7 @@ DevTools 포트가 열려 있으면 로컬의 어떤 프로세스든 인증 없�
 `adb`로 Android 에뮬레이터나 루팅된 테스트 기기를 실행 중인 gori에 연결합니다. 팔레트의 **Set up Android device**를 스크립트에서 쓰는 형태입니다. gori는 loopback 바인드를 유지하고, `adb reverse`가 기기의 `127.0.0.1:PORT`를 gori로 이어 주며, 기기의 전역 HTTP 프록시가 그 주소로 설정됩니다.
 
 ```bash
-gori run android devices                 # serial, 상태, 모델, api=N,emulator,root
+gori run android devices                 # serial, 상태, 모델, api=N,emulator,root (adbd가 root일 때; 목록은 su를 묻지 않음)
 gori run android setup --dry-run         # adb 명령만 출력하고 아무것도 바꾸지 않음
 gori run android setup --system          # root로 CA를 시스템 저장소에 신뢰 등록
 gori run android undo
@@ -628,7 +628,7 @@ gori run send --url https://api.example.com --request-file req.http --headers-on
 
 WebSocket 핸드셰이크인 요청은 평범한 요청으로 나가고 그 `101`이 응답이 되며, 명령은 이를 STDERR에 알립니다. 프레임을 주고받는 교환에는 세션이 필요합니다: `repeater create` 다음 `repeater send`를 쓰세요.
 
-`send`, `repeater <flow-id>`, `repeater send`의 `--format json`은 원시 `head` 옆에 MCP `send_request`의 오류 계약을 싣습니다. 실패한 전송에는 `error_kind`(`connect`, `timeout`, `protocol`, `no_response`, `truncated_request`, `other`), `error_code`, `retryable`, `delivered`가 붙으므로, 스크립트는 `error` 문장을 매칭하지 않고도 거부된 연결과 타임아웃을 구분할 수 있습니다. 응답에는 `reason`, `http_version`, 파싱된 `headers`(`[{"name","value"}]`, 와이어 순서, UTF-8이 아닌 값에는 `value_lossy`/`value_base64`)가 붙습니다. `match_replace_applied: true`는 `--apply-rules`가 요청을 바꿨다는 뜻입니다.
+`send`, `repeater <flow-id>`, `repeater send`의 `--format json`은 원시 `head` 옆에 MCP `send_request`의 오류 계약을 싣습니다. 실패한 전송에는 `error_kind`(`connect`, `timeout`, `protocol`, `no_response`, `truncated_request`, `budget`, `other`), `error_code`, `retryable`, `delivered`가 붙으므로, 스크립트는 `error` 문장을 매칭하지 않고도 거부된 연결과 타임아웃을 구분할 수 있습니다. 응답에는 `reason`, `http_version`, 파싱된 `headers`(`[{"name","value"}]`, 와이어 순서, UTF-8이 아닌 값에는 `value_lossy`/`value_base64`)가 붙습니다. `match_replace_applied: true`는 `--apply-rules`가 요청을 바꿨다는 뜻입니다.
 
 ### run fuzz {#run-fuzz}
 
