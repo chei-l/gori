@@ -37,6 +37,9 @@ module Gori
 
         vars = environment_table(resources)
         groups = request_groups(resources)
+        # One layered table per folder, not per request: the export decides how many requests a
+        # folder holds, and re-flattening its environment for each one multiplied that cost.
+        folder_tables = {} of String => Vars::Table
         now = Time.utc.to_unix * 1_000_000
         pairs = [] of Builder::FlowPair
         missing = Set(String).new
@@ -49,7 +52,8 @@ module Gori
           found += 1
           # One bad request skips; the rest of the export still imports.
           begin
-            pairs << Vars.per_entry { resource_to_flow(now, h, folder_vars(h, groups, vars), missing, prov) }
+            table = folder_tables.put_if_absent(h["parentId"]?.to_s) { folder_vars(h, groups, vars) }
+            pairs << Vars.per_entry { resource_to_flow(now, h, table, missing, prov) }
           rescue
             skipped += 1
           end
@@ -89,14 +93,32 @@ module Gori
 
       # Nunjucks resolves `{{ _.api.host }}` through nested objects, so a nested value is also
       # filed under its dotted path. A later environment REPLACES an object wholesale, so the
-      # dotted keys an earlier one filed under that name go first.
-      private def self.flatten_into(table : Vars::Table, data : Hash(String, JSON::Any), prefix : String = "") : Nil
+      # dotted keys an earlier one filed under that name go first: in one pass over the table
+      # per environment, since a pass per key was quadratic in the key count. Every object is
+      # also filed whole, so the walk stops at MAX_DEPTH: each level holds a copy of the
+      # subtree under it, and a 500-deep nest made one 2 MB export cost a gigabyte.
+      MAX_DEPTH = 32
+
+      private def self.flatten_into(table : Vars::Table, data : Hash(String, JSON::Any), prefix : String = "", depth : Int32 = 0) : Nil
+        if prefix.empty? && !table.empty?
+          table.reject! { |name, _| replaced_under?(name, data) }
+        end
         data.each do |k, v|
           key = prefix.empty? ? k : "#{prefix}.#{k}"
-          table.reject! { |name, _| name.starts_with?("#{key}.") }
           table[key] = Vars.value_to_s(v)
-          v.as_h?.try { |nested| flatten_into(table, nested, key) }
+          next if depth >= MAX_DEPTH
+          v.as_h?.try { |nested| flatten_into(table, nested, key, depth + 1) }
         end
+      end
+
+      # Whether `name` is a dotted path under one of `data`'s top-level keys.
+      private def self.replaced_under?(name : String, data : Hash(String, JSON::Any)) : Bool
+        i = 0
+        while i = name.byte_index('.'.ord, i)
+          return true if data.has_key?(name.byte_slice(0, i))
+          i += 1
+        end
+        false
       end
 
       # The `request_group` (folder) resources by id, for `folder_vars` to walk.
