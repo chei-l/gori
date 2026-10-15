@@ -88,7 +88,8 @@ module Gori
       # silent into their own sentences, which land on "other"/"timeout" as they should),
       # "timeout" (idle read/write, and a TLS handshake that never got an answer), "protocol" (a deterministic
       # framing/protocol refusal — see PROTOCOL_ERROR_PHRASES), "no_response", "budget" (the
-      # project request budget refused it), else "other".
+      # project request budget refused it), "busy" (the project database would not lease a
+      # budget slot: nothing was spent, so it is worth a retry), else "other".
       #
       # A pure function of the engine's sentence, so it is `self.` and directly testable: the
       # retry policy an agent applies hangs off it, and the sentences it reads are written in
@@ -98,7 +99,7 @@ module Gori
         return nil unless message
         # gori's own refusal before the socket (#1601): the project budget refuses every later
         # send too, so it is a stop, not the transient "other" a retry policy loops on.
-        return "budget" if Outbound.budget_refusal?(message)
+        return budget_kind(message) if Outbound.budget_refusal?(message)
         m = message.downcase
         return "connect" if m.starts_with?("connect failed")
         return "timeout" if m.includes?("timed out") || m.includes?("timeout")
@@ -117,6 +118,11 @@ module Gori
         "other"
       end
 
+      # A busy project database that would not lease a slot spent nothing: worth a retry.
+      private def self.budget_kind(message : String) : String
+        message == Outbound::BUDGET_UNAVAILABLE_ERROR ? "busy" : "budget"
+      end
+
       # Split out and `self.` for the same reason `kind` is: the retry policy an
       # agent applies hangs off this mapping, and pinning it in a spec is what stops a new kind
       # from silently landing in the retryable bucket by falling through the `else`.
@@ -125,6 +131,7 @@ module Gori
         when "protocol"          then "PROTOCOL_ERROR"
         when "truncated_request" then "REQUEST_TRUNCATED"
         when "budget"            then "BUDGET_EXHAUSTED"
+        when "busy"              then "PROJECT_BUSY"
         else                          "NETWORK_ERROR"
         end
       end
@@ -132,7 +139,7 @@ module Gori
       # `self.` and separate from `code` for the same reason: this is the field an
       # agent branches on, so a spec pins the PAIR rather than the code mapping alone.
       def self.retryable?(code : String, delivered : Bool) : Bool
-        code == "NETWORK_ERROR" && !delivered
+        (code == "NETWORK_ERROR" || code == "PROJECT_BUSY") && !delivered
       end
     end
   end
