@@ -1,4 +1,8 @@
 require "base64"
+require "compress/gzip"
+require "compress/zlib"
+require "compress/deflate"
+require "../../ascii_bytes"
 require "../../media_type"
 require "../../plural"
 
@@ -299,6 +303,100 @@ module Gori::Proxy::H2
         pos = msg_start + count
       end
       {msgs, body.size - pos}
+    end
+
+    # Ceiling on one inflated message: gRPC's own default max receive size (4 MiB, every
+    # mainstream implementation). A frame that inflates past it is refused, not decoded in
+    # part, so a small decompression bomb costs one capped read and nothing more (P6).
+    INFLATE_MAX = 4 * 1024 * 1024
+
+    # Ceiling on everything ONE body inflates to, across its frames. The per-message cap alone
+    # let a body of many small bombs (~4 KB each on the wire, 4 MiB each inflated) hold
+    # hundreds of MiB on one History row select or one reflection reply.
+    INFLATE_BUDGET = 16 * 1024 * 1024
+
+    # The stream's `grpc-encoding` off a message head, lowercased — nil when it names none.
+    # A native call's trailers are already merged into a captured or replayed head, so a
+    # codec named only there is read too.
+    def self.encoding(head : Bytes?) : String?
+      h = head || return nil
+      AsciiBytes.each_head_field(h) do |na, nz, va, vz|
+        next unless AsciiBytes.range_eq_ci?(h, na, nz, ENCODING_HEADER)
+        return String.new(h[va, vz - va]).scrub.downcase.presence
+      end
+      nil
+    end
+
+    private ENCODING_HEADER = "grpc-encoding".to_slice
+
+    # A COMPRESSED message's payload inflated under `encoding` — or the sentence saying why
+    # not. A derived projection only (P7): the captured frame is never rewritten. `identity`
+    # gives the bytes back (a flag the codec contradicts is shown, not hidden); an unknown
+    # codec, a corrupt or truncated stream, and output past `max_out` are refused.
+    def self.inflate(encoding : String?, data : Bytes, max_out : Int32 = INFLATE_MAX) : Bytes | String
+      inflate_into(encoding, data, max_out, IO::Memory.new)
+    end
+
+    # The protobuf bytes behind each of `msgs`: the payload itself, or a compressed one
+    # inflated under the stream's `encoding` — a String says why there are none. Every frame
+    # draws on ONE `budget` for the whole body (P6); once it is spent the remaining compressed
+    # frames are not inflated at all. Charged by what each inflate actually PRODUCED, so a
+    # refused bomb or a stream that turns corrupt late still pays for the work it cost.
+    def self.payloads(msgs : Array(Message), encoding : String?,
+                      budget : Int32 = INFLATE_BUDGET) : Array(Bytes | String)
+      left = budget
+      msgs.map do |m|
+        next m.data if m.trailer || !m.compressed
+        spent = "not inflated — this body's #{budget}-byte inflate budget is spent"
+        next spent if left <= 0
+        limit = {INFLATE_MAX, left}.min
+        sink = IO::Memory.new
+        plain = inflate_into(encoding, m.data, limit, sink)
+        left -= sink.bytesize
+        # Cut by what is left of the budget, not by the per-message cap: say which.
+        plain.is_a?(String) && limit < INFLATE_MAX && sink.bytesize > limit ? spent : plain
+      end
+    end
+
+    private def self.inflate_into(encoding : String?, data : Bytes, max_out : Int32,
+                                  sink : IO::Memory) : Bytes | String
+      case enc = encoding.try(&.strip.downcase)
+      when "identity" then data
+      when "gzip"     then drain(Compress::Gzip::Reader.new(IO::Memory.new(data)), max_out, sink)
+      when "deflate"
+        # gRPC's `deflate` is zlib-wrapped (RFC 1950), but some producers write a raw RFC 1951
+        # stream under the same name. The 2-byte zlib header (CM 8, check bits ≡ 0 mod 31)
+        # says which, so neither reading is tried and thrown away.
+        io = IO::Memory.new(data)
+        zlib = data.size >= 2 && data[0] & 0x0f == 8 && ((data[0].to_u16 << 8) | data[1]) % 31 == 0
+        drain(zlib ? Compress::Zlib::Reader.new(io) : Compress::Deflate::Reader.new(io), max_out, sink)
+      when nil
+        "the frame says compressed but no grpc-encoding header names the codec"
+      else
+        "compressed with grpc-encoding #{enc.inspect}, which gori does not inflate (gzip, deflate)"
+      end
+    rescue ex # a corrupt or truncated stream — refused, never a partial decode
+      "#{encoding} inflate failed: #{ex.message}"
+    end
+
+    # `inflate`'s inverse for an edited message: re-compressed with the SAME codec, so the
+    # 0x01 flag stays true. nil for a codec gori cannot write. The octets will not match the
+    # original deflate stream — a surface that sends this says so.
+    def self.compress(encoding : String?, data : Bytes) : Bytes?
+      io = IO::Memory.new
+      case encoding.try(&.strip.downcase)
+      when "identity" then return data
+      when "gzip"     then Compress::Gzip::Writer.open(io, &.write(data))
+      when "deflate"  then Compress::Zlib::Writer.open(io, &.write(data))
+      else                 return nil
+      end
+      io.to_slice
+    end
+
+    private def self.drain(reader : IO, max_out : Int32, sink : IO::Memory) : Bytes | String
+      IO.copy(reader, sink, max_out.to_i64 + 1)
+      return "inflates past the #{max_out}-byte cap — refused as a decompression bomb" if sink.bytesize > max_out
+      sink.to_slice
     end
 
     # `scan`'s residual as the sentence every surface should show, or nil when the body

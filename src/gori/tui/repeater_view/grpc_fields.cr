@@ -85,14 +85,28 @@ class Gori::Tui::RepeaterView
   # Whether the FIELDS form has anything to show. Unary only (same reason `^X` is: a 0- or
   # multi-message body has no single payload to edit), and schema-only.
   #
-  # `!@grpc_compressed` is the carve-out `ProtobufTree.decode?` already makes for every other
-  # gRPC surface: the frame's `0x01` flag says the payload is compressed, and compressed bytes
-  # are not a protobuf message until something inflates them — which gori does not. Without
-  # this the form ran `Protobuf.decode` over a deflate stream and either reported "(no fields
-  # in this message)" (indistinguishable from an empty one) or listed whatever the compressed
-  # bytes happened to parse as, under the `.proto`'s field NAMES.
+  # A compressed payload (the frame's `0x01` flag) is a protobuf message only once
+  # `grpc_plain_payload` has inflated it under the codec it is in (#1629). One that
+  # does not inflate — an unknown codec, a corrupt stream, a bomb — gets no form, the carve-out
+  # `ProtobufTree.decode?` makes for every other gRPC surface: running `Protobuf.decode` over a
+  # deflate stream lists whatever the compressed bytes happen to parse as, under the `.proto`'s
+  # field NAMES.
   def grpc_fields_available? : Bool
-    @grpc_mode && @grpc_reframable && !@grpc_compressed && !grpc_field_binding.nil?
+    @grpc_mode && @grpc_reframable && grpc_plain_payload.is_a?(Bytes) && !grpc_field_binding.nil?
+  end
+
+  # `@grpc_payload` as protobuf: the payload itself, or a compressed one inflated (#1629) — a
+  # String says why it is not. Cached because the FIELDS badge asks on every frame; every
+  # writer of `@grpc_payload` calls `invalidate_grpc_fields`, which drops it.
+  private def grpc_plain_payload : Bytes | String
+    return @grpc_payload unless @grpc_compressed
+    @grpc_plain ||= Proxy::H2::Grpc.inflate(@grpc_encoding, @grpc_payload)
+  end
+
+  # The `grpc-encoding` the head in the editor declares NOW — what an edited compressed
+  # payload is re-compressed with, so the frame goes out in the codec the request names.
+  private def grpc_head_encoding : String?
+    Proxy::H2::Grpc.encoding(@editor.wire_text.to_slice)
   end
 
   # `␣Pf` / `repeater.toggle-grpc-fields`. Returns the new state; the controller owns the
@@ -144,6 +158,7 @@ class Gori::Tui::RepeaterView
   # `@grpc_payload` calls this (`load_grpc`, `exit_request_hex`, `grpc_field_apply`) rather
   # than inlining the pair, so the next one to be added has one example and not three.
   protected def invalidate_grpc_fields : Nil
+    @grpc_plain = nil
     @grpc_payload_rev += 1
     @grpc_field_key = nil
   end
@@ -206,7 +221,7 @@ class Gori::Tui::RepeaterView
              return refuse_grpc_field("the descriptor set for this rpc is no longer loaded")
     encoded = Protobuf::Encoder.encode(schema, d, text, packed: row.packed)
     return refuse_grpc_field(encoded) if encoded.is_a?(String)
-    rebuilt = Protobuf::Encoder.replace(@grpc_payload, row.path, encoded)
+    rebuilt = grpc_field_splice(row.path, encoded)
     return refuse_grpc_field(rebuilt) if rebuilt.is_a?(String)
     # Only NOW is anything mutated — a refusal above leaves the payload exactly as captured.
     # And an untouched value mutates nothing either (P7), the same `text == seed` skip the
@@ -216,6 +231,7 @@ class Gori::Tui::RepeaterView
     # AFTER the splice so a payload that changed under the editor is still refused.
     unless text == row.seed
       @grpc_payload = rebuilt
+      note_grpc_recompressed
       @dirty = true
     end
     close_grpc_field_input
@@ -225,6 +241,26 @@ class Gori::Tui::RepeaterView
     # screen, and rebuilding them now would re-label a PAST send with the byte count of a
     # payload it never carried. `apply` rebuilds them per send.
     nil
+  end
+
+  # `encoded` spliced into the payload as protobuf, and — for a compressed frame — the result
+  # re-compressed with the head's CURRENT codec, so it goes back out behind the same flag in
+  # the encoding the request declares (#1629). A String is the refusal.
+  private def grpc_field_splice(path : Array(Int32), encoded : Bytes) : Bytes | String
+    plain = grpc_plain_payload
+    return plain if plain.is_a?(String)
+    rebuilt = Protobuf::Encoder.replace(plain, path, encoded)
+    return rebuilt if rebuilt.is_a?(String) || !@grpc_compressed
+    enc = grpc_head_encoding
+    Proxy::H2::Grpc.compress(enc, rebuilt) || "gori cannot re-compress with grpc-encoding #{enc.inspect}"
+  end
+
+  # A spliced compressed payload is now in the head's codec, and the transcript says it was
+  # re-compressed.
+  private def note_grpc_recompressed : Nil
+    return unless @grpc_compressed
+    @grpc_recompressed = true
+    @grpc_encoding = grpc_head_encoding
   end
 
   # Every refusal `grpc_field_apply` can make, recorded so the PANE shows it and returned so
@@ -309,7 +345,9 @@ class Gori::Tui::RepeaterView
 
   private def build_grpc_field_rows : Array(GrpcFieldRow)
     b = grpc_field_binding || return [] of GrpcFieldRow
-    RepeaterView.grpc_form_rows(@grpc_payload, b.schema, b.type)
+    plain = grpc_plain_payload
+    return [] of GrpcFieldRow if plain.is_a?(String)
+    RepeaterView.grpc_form_rows(plain, b.schema, b.type)
   end
 
   # The walk itself, with no view state in it: one payload read through one message
@@ -496,6 +534,9 @@ class Gori::Tui::RepeaterView
              "⚠ #{note}"
            elsif row.editable?
              back = "#{menu_chip("repeater.toggle-grpc-fields")} back to the head"
+             # Said before the edit, not only after the send: the bytes will not match the
+             # captured deflate stream (#1629).
+             back = "#{back} · edits re-compress as #{grpc_head_encoding}" if @grpc_compressed
              focused ? "↵ edit this field · #{back}" : back
            else
              ""

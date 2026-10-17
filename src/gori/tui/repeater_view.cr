@@ -268,7 +268,14 @@ module Gori::Tui
       # Headless the operator may be sending a deliberately-wrong prefix, which is P7's default
       # and a standard gRPC parser test. See DESIGN.md §7.
       @grpc_reframe = true
-      @grpc_compressed = false    # the editable message's compressed flag (preserved on reframe)
+      @grpc_compressed = false # the editable message's compressed flag (preserved on reframe)
+      # The codec `@grpc_payload` is compressed with (the captured `grpc-encoding`, until a
+      # FIELDS edit re-compresses it with the head's current one), and whether one has (#1629) —
+      # the transcript says so, since the octets no longer match the captured deflate stream.
+      # `@grpc_plain` caches the inflated payload until `invalidate_grpc_fields`.
+      @grpc_encoding = nil.as(String?)
+      @grpc_recompressed = false
+      @grpc_plain = nil.as((Bytes | String)?)
       @grpc_payload = Bytes.empty # the current (possibly hex-edited) single-message payload
       @grpc_lines_cache = nil.as(Array({String, Color})?)
       # `␣Pf` FIELDS: the schema-typed form over that same payload (#828). Available only when
