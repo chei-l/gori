@@ -119,6 +119,35 @@ private class NoopWsRewriter < Gori::Proxy::HeadRewriter
   end
 end
 
+# An upstream whose FIRST write runs `on_write` before it: with nothing relayed to the origin
+# yet, that write is the relay's own teardown flush.
+private class TeardownTap < IO
+  @fired = false
+
+  def initialize(@io : IO, &@on_write : ->)
+  end
+
+  def read(slice : Bytes) : Int32
+    @io.read(slice)
+  end
+
+  def write(slice : Bytes) : Nil
+    unless @fired
+      @fired = true
+      @on_write.call
+    end
+    @io.write(slice)
+  end
+
+  def flush : Nil
+    @io.flush
+  end
+
+  def close : Nil
+    @io.close
+  end
+end
+
 # Run a relay for `flow_id`, hand the rig to the block, then shut it down and reap the relay.
 private def with_relay(sink : Gori::Proxy::FlowSink, flow_id : Int64,
                        rewriter : Gori::Proxy::HeadRewriter? = nil, interceptor : Gori::Interceptor? = nil, &)
@@ -341,6 +370,52 @@ describe Gori::Proxy::WS::Live do
     end
   end
 
+  # `Live.unregister` closed the legs only after teardown's yields (settle, the flush, the
+  # teardown rows), and an inject in that window was written and acked into a closing socket.
+  it "refuses an inject once the relay has begun tearing down" do
+    sink = LiveSink.new
+    cs_r, cs_w = IO.pipe
+    ts_r, ts_w = IO.pipe
+    ss_r, ss_w = IO.pipe
+    tc_r, tc_w = IO.pipe
+    during = "not reached"
+    upstream = TeardownTap.new(IO::Stapled.new(ss_r, ts_w, sync_close: true)) do
+      during = inject(sink, 416_i64, "in", WS::OP_TEXT, "late") || "injected"
+    end
+    done = Channel(Nil).new(1)
+    spawn do
+      WS::Relay.run(IO::Stapled.new(cs_r, tc_w, sync_close: true), upstream, 416_i64, sink,
+        NoopWsRewriter.new, LIVE_CTX)
+      done.send(nil)
+    end
+    await_live(sink, 416_i64)
+    # Half a message the assembling pump withholds, so the teardown has a write to make.
+    cs_w.write(masked_frame(WS::OP_TEXT, "half", fin: false))
+    sleep 20.milliseconds
+    ss_w.close # the origin hangs up: the relay tears down
+    receive_within(done, 5, "the relay to end")
+    cs_w.close rescue nil
+    during.should eq(WS::Live::CLOSED)
+    sink.rows.none?(&.[3]).should be_true
+    {ts_r, tc_r}.each { |io| io.close rescue nil }
+  end
+
+  # A header and part of its payload went out: the next byte on that side would be read as
+  # the rest of the payload, so an inject there corrupted the stream and reported success.
+  it "closes a leg it could only half forward an oversized frame on" do
+    src = IO::Memory.new
+    src.write(Bytes[0x82, 127])
+    IO::ByteFormat::BigEndian.encode(WS::MAX_FRAME + 1, src)
+    src.write(Bytes.new(10)) # ... and then the peer is gone
+    src.rewind
+    h = WS.read_header(src).not_nil!
+    leg = WS::Leg.new("in", IO::Memory.new, mask: false)
+    WS::Relay.forward_oversized_frame(src, leg, h, "in", 1_i64, LiveSink.new, WS::OP_BIN,
+      Bytes.new(4096)).should be_false
+    leg.closed?.should be_true
+    leg.inject(WS::OP_TEXT, "x".to_slice, 100.milliseconds).should eq(WS::Live::CLOSED)
+  end
+
   it "lets a control frame in mid-message" do
     sink = LiveSink.new
     with_relay(sink, 404_i64) do |r|
@@ -456,6 +531,37 @@ describe "WS::Live.apply_command (the capturing instance's drain)" do
         store.command_status(id).should eq({"injected", "TEXT 5B client→server on flow #410"})
       end
     end
+  end
+
+  # The sender stops polling `Store.ws_inject_ack_budget_ms` after enqueueing and reports the
+  # inject unconfirmed; one written after that would land again on the agent's retry.
+  it "refuses a command whose sender has stopped waiting, and writes nothing" do
+    with_store do |store|
+      sink = LiveSink.new
+      with_relay(sink, 417_i64) do |r|
+        id = store.enqueue_intercept_command("t", Gori::Store::WS_INJECT_VERB, item_id: 417_i64,
+          bytes: "late".to_slice, arg: Gori::Store.ws_inject_arg("out", WS::OP_TEXT))
+        cmd = store.intercept_commands_after(0_i64, 10).find(&.id.==(id)).not_nil!
+        cmd.created_at.should be > 0
+        stale = Gori::Store::CommandRow.new(cmd.id, cmd.session_token, cmd.verb, cmd.item_id,
+          cmd.bytes, cmd.arg, cmd.created_at - Gori::Store.ws_inject_ack_budget_ms.to_i64 * 1000)
+        WS::Live.apply_command(store, sink, ungated_outbound, stale) { |_| }.should be_true
+        200.times { break unless store.command_status(id).try(&.[0]) == "pending"; sleep 5.milliseconds }
+        store.command_status(id).should eq({"refused", WS::Live::EXPIRED})
+        # Nothing reached the origin: the next frame it reads is one written after the refusal.
+        r.cs_w.write(masked_frame(WS::OP_TEXT, "next"))
+        String.new(read_frame(r.ts_r).payload).should eq("next")
+        sink.rows.none?(&.[3]).should be_true
+      end
+    end
+  end
+
+  # The sender counts its budget on its own clock: a created_at ahead of this one (a wall clock
+  # stepped back since) must not stretch the deadline past what the sender waits.
+  it "never sets an inject's deadline past the sender's budget" do
+    budget = Gori::Store.ws_inject_ack_budget_ms.milliseconds - WS::Live::ACK_MARGIN
+    ahead = (Time.utc - Time::UNIX_EPOCH).total_microseconds.to_i64 + 3_600_000_000_i64
+    (WS::Live.ack_deadline(ahead) <= Time.instant + budget).should be_true
   end
 
   it "acks a closed socket at once, naming why" do

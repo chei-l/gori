@@ -51,6 +51,9 @@ private class Peer
   # Stream credit is held back until this much is owed, the way curl/nghttp2 and Firefox ack a
   # wide per-stream window: late. 0 = every frame.
   property stream_ack = 0_i64
+  # While set, connection credit is held back until `release_conn`: a reader that stopped.
+  property? hold_conn = false
+  @held_conn = 0
 
   # Both connection windows, readable once the exchange is at rest: the sender's view of the
   # receiver's window has to equal the receiver's own, or credit was stranded or invented.
@@ -181,8 +184,15 @@ private class Peer
     String.new(bodies[stream].to_slice)
   end
 
-  private def send_window(stream : UInt32) : Int64
+  def send_window(stream : UInt32) : Int64
     @send_streams[stream]? || @send_initial
+  end
+
+  def release_conn : Nil
+    @hold_conn = false
+    @recv_conn += @held_conn
+    window_update(0_u32, @held_conn) if @held_conn > 0
+    @held_conn = 0
   end
 
   private def wait_window(stream : UInt32) : Int32?
@@ -302,8 +312,12 @@ private class Peer
   end
 
   private def grant(stream : UInt32, n : Int32, ended : Bool) : Nil
-    @recv_conn += n
-    window_update(0_u32, n)
+    if @hold_conn
+      @held_conn += n
+    else
+      @recv_conn += n
+      window_update(0_u32, n)
+    end
     return if ended
     @unacked[stream] += n
     return if @unacked[stream] < @stream_ack
@@ -875,6 +889,34 @@ describe "H2::StreamGate body rules (#1628)" do
     end
   end
 
+  # A body that finished arriving still sits with gori until a slow reader takes it, and its
+  # sender was credited on arrival: it counts against the budget until it is written, or three
+  # 8 MiB downloads to a client that never widens its streams hold 24 MiB.
+  it "counts a finished body against the budget until the receiver takes it" do
+    with_rules do |rules, ic|
+      rules.add(RESP, BODY, "zzz", "yyy", host: "127.0.0.1")
+      size = 8 * 1024 * 1024
+      sent = [] of UInt32
+      rig = BodyRig.new(rules, ic) do |s, p|
+        spawn do
+          p.send(s, ok(size), Bytes.new(size, 'a'.ord.to_u8))
+          sent << s
+        end
+        nil
+      end
+      begin
+        rig.client.stream_ack = 1_000_000_000_i64 # a slow reader: no stream credit past the first window
+        [1_u32, 3_u32, 5_u32].each do |id|
+          rig.client.send_head(id, get("/big#{id}"), true)
+          40.times { break if sent.includes?(id); sleep 50.milliseconds }
+        end
+        sent.should eq([1_u32, 3_u32]) # the third spilled, so its origin is credited only as gori sends
+      ensure
+        rig.close
+      end
+    end
+  end
+
   # Review #5: h1 runs no rule over an empty body, so a `^` pattern does not invent one.
   it "runs no rule over an empty body" do
     with_rules do |rules, ic|
@@ -966,6 +1008,58 @@ describe "H2::StreamGate body rules (#1628)" do
     end
   end
 
+  # A client that advertises a zero initial window and opens each stream only once its response
+  # head is in: that credit is the origin's only way to send at all, so it cannot stop at gori.
+  it "passes stream credit through to a sender that has none" do
+    with_rules do |rules, ic|
+      rules.add(RESP, BODY, "b", "c", host: "127.0.0.1")
+      rig = BodyRig.new(rules, ic, client_window: 0_i64) { |_, _| {ok, "bbbb".to_slice, nil} }
+      begin
+        rig.client.send_head(1_u32, get("/x"), true)
+        50.times { break if rig.client.heads.has_key?(1_u32); sleep 20.milliseconds }
+        rig.client.bump(1_u32, 100_000)
+        rig.client.wait_done(1_u32, 3.seconds).should be_true
+        rig.client.body_of(1_u32).should eq("cccc")
+        (rig.client.errors + rig.wait_origin.errors).should be_empty
+      ensure
+        rig.close
+      end
+    end
+  end
+
+  # A spilled stream whose sender has used its whole window while the receiver's connection
+  # window is spent: gori owes the sender the credit of every frame it still queues, so stream
+  # credit the receiver grants then is not the sender's as well, or it is paid twice.
+  it "passes no stream credit to a sender that queued frames gori still owes it for" do
+    with_rules do |rules, ic|
+      rules.add(RESP, BODY, "b", "c", host: "127.0.0.1")
+      rig = BodyRig.new(rules, ic) do |s, p|
+        p.send_head(s, ok, false)
+        p.send_raw_data(s, Bytes[2] + "aaaaaaa".to_slice + Bytes[0, 0], Frame::PADDED) # spills it
+        p.send_body(s, Bytes.new(200_000, 'a'.ord.to_u8), true)
+        nil
+      end
+      begin
+        rig.client.hold_conn = true
+        rig.client.stream_ack = 1_000_000_000_i64
+        rig.client.send_head(1_u32, get("/x"), true)
+        origin = rig.wait_origin
+        100.times { break if origin.send_conn == 0 && origin.send_window(1_u32) == 0; sleep 20.milliseconds }
+        origin.send_window(1_u32).should eq(0)
+        rig.client.bump(1_u32, 1_000)
+        sleep 100.milliseconds
+        origin.send_window(1_u32).should eq(0)
+        rig.client.release_conn
+        rig.client.bump(1_u32, 200_000)
+        rig.client.wait_done(1_u32).should be_true
+        rig.client.bodies[1_u32].size.should eq(200_010)
+        (rig.client.errors + origin.errors).should be_empty
+      ensure
+        rig.close
+      end
+    end
+  end
+
   # Review r2 #1: credit a client gives a stream AFTER its response ended (a slow reader acking
   # what it consumed) used to stay recorded for good, and past 1,024 such streams the stall the
   # pre-response credit fixes came back for every new one.
@@ -1039,6 +1133,58 @@ describe "H2::StreamGate body rules (#1628)" do
         rig.client.wait_done(1_u32).should be_true
         rig.client.body_of(1_u32).should eq("ccccc")
         rig.client.goaways.should eq(1)
+        (rig.client.errors + rig.wait_origin.errors).should be_empty
+      ensure
+        rig.close
+      end
+    end
+  end
+
+  # A WebSocket over h2 (RFC 8441): the origin's `:status 200` opens a tunnel that never ends on
+  # its own, so a response rule buffering it would hold every server frame until the socket closed.
+  it "relays an extended CONNECT's tunnel with a response body rule live" do
+    with_rules do |rules, ic|
+      rules.add(RESP, BODY, "zzz", "yyy", host: "127.0.0.1")
+      opened = ->(stream : UInt32, origin : Peer) do
+        origin.send_head(stream, [{":status", "200"}], false)
+        origin.send_body(stream, Bytes[0x81, 0x05] + "hello".to_slice, false)
+        nil
+      end
+      rig = BodyRig.new(rules, ic, opened: opened) { |_, _| nil }
+      begin
+        head = [{":method", "CONNECT"}, {":protocol", "websocket"}, {":scheme", "https"},
+                {":authority", "127.0.0.1"}, {":path", "/chat"}, {"sec-websocket-version", "13"}]
+        rig.client.send_head(1_u32, head, false)
+        50.times { break if rig.client.bodies[1_u32].size > 0; sleep 20.milliseconds }
+        rig.client.bodies[1_u32].size.should eq(7)
+        (rig.client.errors + rig.wait_origin.errors).should be_empty
+      ensure
+        rig.close
+      end
+    end
+  end
+
+  # Past `Assembler::MAX_LIVE_STREAMS` open streams the assembler tracks no new one, so the gate
+  # cannot see that this answer is to a CONNECT; it must not own a response it cannot place.
+  it "relays an extended CONNECT's tunnel the assembler is not tracking" do
+    with_rules do |rules, ic|
+      rules.add(RESP, BODY, "zzz", "yyy", host: "127.0.0.1")
+      last = 2_u32 * Gori::Proxy::H2::Assembler::MAX_LIVE_STREAMS + 1
+      opened = ->(stream : UInt32, origin : Peer) do
+        if stream == last
+          origin.send_head(stream, [{":status", "200"}], false)
+          origin.send_body(stream, Bytes[0x81, 0x05] + "hello".to_slice, false)
+        end
+        nil
+      end
+      rig = BodyRig.new(rules, ic, opened: opened) { |_, _| nil }
+      begin
+        (1_u32...last).step(2) { |id| rig.client.send_head(id, get("/open#{id}"), true) }
+        head = [{":method", "CONNECT"}, {":protocol", "websocket"}, {":scheme", "https"},
+                {":authority", "127.0.0.1"}, {":path", "/chat"}, {"sec-websocket-version", "13"}]
+        rig.client.send_head(last, head, false)
+        100.times { break if rig.client.bodies[last].size > 0; sleep 20.milliseconds }
+        rig.client.bodies[last].size.should eq(7)
         (rig.client.errors + rig.wait_origin.errors).should be_empty
       ensure
         rig.close
@@ -1181,6 +1327,107 @@ describe "H2::StreamGate body rules: the stall deadline" do
       done = g.sink.requests.find! { |r| r.target == "/done" }
       done.advisory.should be_nil
       g.close
+    end
+  end
+end
+
+# Every header block in `frames` for `stream`, decoded in wire order (one HPACK context).
+private def heads_of(frames : Array(Frame::Header), stream : UInt32) : Array(Array({String, String}))
+  dec = HPACK::Decoder.new
+  frames.select(&.frame_type.==(Frame::Type::Headers)).compact_map do |f|
+    fields = dec.decode(f.payload)
+    f.stream_id == stream ? fields : nil
+  end
+end
+
+private def data_of(frames : Array(Frame::Header), stream : UInt32) : String
+  String.build { |io| frames.each { |f| io.write(f.payload) if f.frame_type == Frame::Type::Data && f.stream_id == stream } }
+end
+
+# h1 rewrites a held body before the operator sees it (`ClientConn#handle_held_request`).
+describe "H2::StreamGate body rules: an intercept hold" do
+  it "shows and forwards the rule's rewrite of a held request body" do
+    with_rules do |rules, ic|
+      rules.add(REQ, BODY, "hunter2", "x", host: API)
+      ic.toggle
+      g = GatePair.new(rules, ic, 5.seconds)
+      g.request(1_u32, post("/login", 16, authority: API))
+      g.data(g.out_gate, 1_u32, "password=hunter2", true)
+      item = ic.pending.first
+      String.new(item.raw).should contain("content-length: 10")
+      String.new(item.raw).should end_with("password=x")
+      ic.forward(item.id)
+      sleep 50.milliseconds
+
+      frames = g.frames(g.up)
+      field(heads_of(frames, 1_u32).first, "content-length").should eq("10")
+      data_of(frames, 1_u32).should eq("password=x")
+      captured = g.sink.requests.first
+      String.new(captured.body.not_nil!).should eq("password=x")
+      captured.rewrite.not_nil!.hits.size.should eq(1)
+      captured.intercept_original.should be_nil
+      g.close
+    end
+  end
+
+  it "keeps the client's own request beside an edit of the rewrite" do
+    with_rules do |rules, ic|
+      rules.add(REQ, BODY, "hunter2", "x", host: API)
+      ic.toggle
+      g = GatePair.new(rules, ic, 5.seconds)
+      g.request(1_u32, post("/login", 16, authority: API))
+      g.data(g.out_gate, 1_u32, "password=hunter2", true)
+      item = ic.pending.first
+      ic.forward(item.id, String.new(item.raw).sub("password=x", "password=y").to_slice)
+      sleep 50.milliseconds
+
+      data_of(g.frames(g.up), 1_u32).should eq("password=y")
+      original = String.new(g.sink.requests.first.intercept_original.not_nil!)
+      original.should contain("content-length: 16")
+      original.should end_with("password=hunter2")
+      g.close
+    end
+  end
+
+  # A held response's receiver window is known only as far as its sender was granted it.
+  it "does not grow a held response past what its sender was allowed" do
+    with_rules do |rules, ic|
+      rules.add(RESP, BODY, "a", "aaaa", host: API)
+      ic.toggle
+      ic.set_direction(Gori::Interceptor::Direction::ResponseOnly)
+      g = GatePair.new(rules, ic, 5.seconds)
+      g.request(1_u32, get("/x", API), true)
+      g.response(1_u32, ok(3))
+      g.data(g.in_gate, 1_u32, "aaa", true)
+      ic.forward(ic.pending.first.id)
+      sleep 50.milliseconds
+
+      data_of(g.frames(g.down), 1_u32).should eq("aaa")
+      g.sink.responses.first.advisory.not_nil!.should contain("held at intercept")
+      g.close
+    end
+  end
+end
+
+# `Relay#gates` is private; a thin caller (test binary only) lets the spec read the gates it
+# builds for one connection.
+class Gori::Proxy::H2::Relay
+  def spec_gates : {Gori::Proxy::H2::StreamGate?, Gori::Proxy::H2::StreamGate?}
+    gates(1_i64, Gori::Proxy::H2::Assembler.new(@sink, @host, @port))
+  end
+end
+
+describe "H2::Relay body-rule path" do
+  # A connection no body rule matches pays nothing for the path (P6): no flow-control state, so
+  # every frame takes each gate's plain branch.
+  it "builds flow-control state only for a host a body rule matches" do
+    with_rules do |rules, ic|
+      rules.add(REQ, BODY, "a", "b", host: "alpha.test")
+      [{"127.0.0.1", false}, {"alpha.test", true}].each do |(host, built)|
+        relay = Gori::Proxy::H2::Relay.new(IO::Memory.new, IO::Memory.new, host, 443, BodySink.new,
+          rewriter: rules, interceptor: ic)
+        relay.spec_gates.each { |gate| gate.not_nil!.@flow.nil?.should eq(!built) }
+      end
     end
   end
 end

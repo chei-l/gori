@@ -68,25 +68,25 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     run_external_editor(text, :json) { |t| view.grpc_json_apply(t) }
   end
 
-  # One `path=value` set or added on the request message (#1632). The card stays up on a
-  # refusal, with the spec in it to correct.
+  # One `path=value` set or added on the request message, or `-path` removed (#1632). The card
+  # stays up on a refusal, with the spec in it to correct.
   def repeater_grpc_add_field : Nil
     view = repeater_controller.current_view || return
     if why = view.grpc_edit_begin(schema: false)
       return @toast = "add gRPC field: #{why}"
     end
     subject = if b = view.grpc_field_binding
-                "#{b.type.full_name}: name=value (role=ROLE_ADMIN, profile.age=30) or number:type=value"
+                "#{b.type.full_name}: name=value (role=ROLE_ADMIN, profile.age=30), number:type=value, or -name to remove"
               else
-                "no .proto loaded — number:type=value, type #{Gori::Protobuf::Edit::TYPE_HINT}"
+                "no .proto loaded — number:type=value (-number removes), type #{Gori::Protobuf::Edit::TYPE_HINT}"
               end
     np = NamePromptOverlay.new("ADD gRPC FIELD", subject, "", action: "set", noun: "path=value")
     np.on_commit = -> {
-      if err = view.grpc_add_field(np.name)
+      if err = view.grpc_add_field(np.value)
         @toast = err
         false
       else
-        @toast = "gRPC field set: #{np.name}"
+        @toast = np.name.starts_with?('-') ? "gRPC field removed: #{np.name.lchop('-').lstrip}" : "gRPC field set: #{np.name}"
         true
       end
     }

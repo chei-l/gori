@@ -2158,8 +2158,16 @@ module Gori
       # `sse_max_events` / `sse_max_ms` over the tool's default (#1631): an absent argument takes
       # the default's axis and 0 switches it off — the CLI's `--sse-events` / `--sse-time`.
       private def sse_bound(h, default : Repeater::StreamBound) : Repeater::StreamBound?
-        Repeater::StreamBound.resolve(optional_int_arg(h, "sse_max_events"),
-          optional_int_arg(h, "sse_max_ms").try(&.clamp(0_i64, 3_600_000_i64).milliseconds), default)
+        Repeater::StreamBound.resolve(sse_axis(h, "sse_max_events"),
+          sse_axis(h, "sse_max_ms").try(&.clamp(0_i64, 3_600_000_i64).milliseconds), default)
+      end
+
+      # One axis of `sse_bound`. A negative one is refused, as the CLI's `--sse-events` is:
+      # read as "no limit", it switched the bound off for a caller who meant to tighten it.
+      private def sse_axis(h, key : String) : Int64?
+        v = optional_int_arg(h, key)
+        raise ArgError.new("invalid '#{key}' (must not be negative; 0 = no limit)", key) if v && v < 0
+        v
       end
 
       # The two arguments' schema, worded with the tool's default.
@@ -2828,9 +2836,10 @@ module Gori
       # at least one, so a page whose first row alone is larger still moves the cursor. The
       # caller emits the parts with `raw_rows` and treats `parts.size < rows.size` as a cut:
       # `has_more` stays true and the reply says `cut_by: "bytes"`, so a short page is never
-      # read as the end of the data.
-      private def fit_rows(rows : Array(T), & : JSON::Builder, T, Int32 ->) : Array(String) forall T
-        budget = RowBudget.new
+      # read as the end of the data. `used` is what earlier lists of the same reply already
+      # spent, so two lists share one budget; the first row of each still always fits.
+      private def fit_rows(rows : Array(T), used : Int32 = 0, & : JSON::Builder, T, Int32 ->) : Array(String) forall T
+        budget = RowBudget.new(used)
         rows.each_with_index do |r, i|
           break unless budget.add(JSON.build { |rj| yield rj, r, i })
         end
@@ -2843,7 +2852,9 @@ module Gori
       private class RowBudget
         getter parts = [] of String
         getter? cut = false
-        @used = 0
+
+        def initialize(@used : Int32 = 0)
+        end
 
         def add(part : String) : Bool
           return false if @cut
@@ -2863,6 +2874,23 @@ module Gori
 
       private def emit_cut(j : JSON::Builder, cut : Bool) : Nil
         j.field "cut_by", "bytes" if cut
+      end
+
+      # `rows` from `offset` on, for a list paged by `offset` alone (REPLY_ROWS_BUDGET ends the
+      # page, not a `limit`); `emit_offset_page` writes its fields.
+      private def offset_slice(rows : Array(T), offset : Int32) : Array(T) forall T
+        rows[offset..]? || [] of T
+      end
+
+      # The pagination fields of an `offset_slice` page: returned/offset, `cut_by` when the
+      # budget kept fewer than `page_size` rows, and `has_more` against the `total` rows the
+      # offset counts from. Each tool names its own total.
+      private def emit_offset_page(j : JSON::Builder, offset : Int32, returned : Int32,
+                                   page_size : Int32, total : Int32) : Nil
+        j.field "returned", returned
+        j.field "offset", offset
+        emit_cut(j, returned < page_size)
+        j.field "has_more", offset + returned < total
       end
 
       private def page_args(h, limit : PageLimit) : Page

@@ -57,11 +57,42 @@ module Gori
             filter: opts.filter, limit: opts.limit, in_scope: opts.in_scope,
             issue_limit: opts.issues ? Gori::Diff::ISSUE_RETEST_MAX : 0,
             raise_on_error: true)
-          Result.new(with_ignored_terms(Gori::Diff::Render.json(report, verdicts: opts.verdicts, issues: opts.issues),
-            opts.dropped))
+          diff_page(report, opts)
         ensure
           base_store.close
         end
+      end
+
+      # The rendered report under REPLY_ROWS_BUDGET (#1649): one page of `endpoints` from
+      # `offset`, then the issue retest in what the page left. The diff is recomputed per call
+      # and its rows are sorted, so `offset` pages it; an issue that does not fit is named in
+      # `issues_unshown_ids` (get_issue reads it), since the retest has no page of its own.
+      # The report is built by the shared renderer, so the page is cut from its parsed arrays
+      # and this surface's fields go on after it rather than into it.
+      private def diff_page(report : Gori::Diff::Report, opts : DiffOptions) : Result
+        rendered = JSON.parse(Gori::Diff::Render.json(report, verdicts: opts.verdicts, issues: opts.issues)).as_h
+        listed = rendered["endpoints"].as_a
+        page = offset_slice(listed, opts.offset)
+        rows = fit_rows(page) { |rj, e, _| e.to_json(rj) }
+        all = rendered["issues"]?.try(&.as_a)
+        issues = all.try { |a| fit_rows(a, rows.sum(&.bytesize)) { |rj, e, _| e.to_json(rj) } }
+        Result.new(JSON.build do |j|
+          j.object do
+            rendered.each do |k, v|
+              case k
+              when "endpoints" then j.field(k) { raw_rows(j, rows) }
+              when "issues"    then j.field(k) { raw_rows(j, issues || [] of String) }
+              else                  j.field(k) { v.to_json(j) }
+              end
+            end
+            emit_offset_page(j, opts.offset, rows.size, page.size, listed.size)
+            j.field "total", listed.size
+            if all && issues && issues.size < all.size
+              j.field "issues_unshown_ids", all[issues.size..].map(&.["id"])
+            end
+            emit_ignored_terms(j, opts.dropped)
+          end
+        end)
       end
 
       # The validated argument set, so `diff_projects` reads as resolve-then-run.
@@ -71,7 +102,8 @@ module Gori
         limit : Int32,
         issues : Bool,
         in_scope : Bool,
-        dropped : Array(String)
+        dropped : Array(String),
+        offset : Int32
 
       private def diff_options(h) : DiffOptions | Result
         dropped = [] of String
@@ -81,7 +113,8 @@ module Gori
         return verdicts if verdicts.is_a?(Result)
         DiffOptions.new(filter, verdicts,
           clamp(optional_int_arg(h, "limit"), DIFF_LIMIT),
-          bool_arg(h, "issues", true), bool_arg(h, "in_scope", false), dropped)
+          bool_arg(h, "issues", true), bool_arg(h, "in_scope", false), dropped,
+          clamp_nonneg(optional_int_arg(h, "offset")))
       end
 
       # NOT `ql_filter_or_error`, for two reasons that are really one: that helper reads the
@@ -112,19 +145,6 @@ module Gori
         # diffs more endpoints than asked.
         dropped.concat(QL.analyze(q, scope: QL::SCOPE_SHAPE_ONLY).ignored)
         filter
-      end
-
-      # The rendered report with `ignored_terms` added when the query dropped any. The report is
-      # built by the shared renderer, so the fields go on after it rather than into it.
-      private def with_ignored_terms(json : String, dropped : Array(String)) : String
-        return json if dropped.empty?
-        report = JSON.parse(json).as_h
-        JSON.build do |j|
-          j.object do
-            report.each { |k, v| j.field(k) { v.to_json(j) } }
-            emit_ignored_terms(j, dropped)
-          end
-        end
       end
 
       # The NEWER side: a named project (opened read-only here, ours to close) or — when
@@ -215,6 +235,7 @@ module Gori
           s.field "verdicts", strarrprop("only return endpoints with these verdicts: added, gone, changed, unchanged, removed (default: all)")
           s.field "issues", boolprop("include the issue retest — which endpoint each of the baseline's open issues sits on, and whether it still answers the same way (default true)")
           s.field "limit", limitprop("max endpoint groups to read per side", DIFF_LIMIT)
+          s.field "offset", intprop("endpoint rows to skip (default 0): a reply holds about 64 KB, and `has_more` / `total` say what is left")
           s.field "lenient", boolprop("search a `field:` QL does not implement as literal TEXT instead of refusing the query (default false) — a typo free-texts its whole token and matches nothing on both sides")
         end
       end

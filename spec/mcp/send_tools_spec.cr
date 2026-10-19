@@ -153,7 +153,23 @@ describe Gori::MCP::Server do
         payload["bounded"].as_s.should eq("events")
         payload["incomplete_reason"].as_s.should contain("event bound")
         # A stop gori chose is not a failed response on the History row either.
-        store.get_flow(payload["recorded_flow_id"].as_i64).not_nil!.row.state.complete?.should be_true
+        detail = store.get_flow(payload["recorded_flow_id"].as_i64).not_nil!
+        detail.row.state.complete?.should be_true
+        detail.event_times.not_nil!.size.should eq(2) # `t_ms` in a later get_flow
+      end
+    end
+
+    # The CLI's `--sse-events` refuses a negative count; MCP read one as "no limit".
+    it "refuses a negative sse_max_events or sse_max_ms" do
+      with_store do |store|
+        {"sse_max_events", "sse_max_ms"}.each do |key|
+          call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_request","arguments":{"url":"http://127.0.0.1:1/","allow_unscoped":true,"#{key}":-1}}})
+          resp = mcp_drive(store, call, verify_upstream: false)[0]
+          resp["result"]["isError"].as_bool.should be_true
+          error = resp["result"]["structuredContent"]
+          error["error_code"].as_s.should eq("INVALID_ARGUMENT")
+          error["message"].as_s.should contain(key)
+        end
       end
     end
 

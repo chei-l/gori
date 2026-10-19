@@ -161,8 +161,16 @@ class Gori::Tui::RepeaterView
   # is present, in place of the scripted `@ws_result` rows.
   private def ws_live_lines(s : Repeater::WsSession) : Array({String, Color})
     rows = [] of {String, Color}
+    # The handshake note (a bad/missing Sec-WebSocket-Accept from `verify_accept`, say): the
+    # live ring replaces `@ws_result`'s rows, so it is drawn here (#1630).
+    if note = @ws_result.try(&.note)
+      rows << {"⚠ #{note}", Theme.yellow}
+    end
     if s.dropped > 0
       rows << {"… #{s.dropped} earlier #{s.dropped == 1 ? "frame" : "frames"} dropped (transcript full)", Theme.yellow}
+    end
+    if s.keepalive_unrecorded > 0
+      rows << {"… #{s.keepalive_unrecorded} keepalive #{s.keepalive_unrecorded == 1 ? "frame" : "frames"} answered, not shown", Theme.muted}
     end
     s.transcript.each do |e|
       m = e.message

@@ -76,6 +76,7 @@ describe Gori::Repeater::StreamBound do
       result.incomplete?.should be_true # the socket still carries the rest
       result.timed_out?.should be_false
       events_in(result).should eq(3)
+      result.event_times.not_nil!.size.should eq(3) # one per kept event, for the row it records
     end
 
     it "stops a close-delimited stream at the event bound" do
@@ -118,6 +119,7 @@ describe Gori::Repeater::StreamBound do
       result.incomplete?.should be_true
       result.timed_out?.should be_false
       events_in(result).should eq(3)
+      result.event_times.not_nil!.size.should eq(3)
     end
 
     it "stops at the time bound even while a read is blocked" do
@@ -171,6 +173,12 @@ describe Gori::Repeater::StreamBound do
     it "is bounded by default on a Fuzzer and a Miner run" do
       Gori::Fuzz::Config.new.sse.should eq(StreamBound::SWEEP)
       Gori::Miner::Config.new.sse.should eq(StreamBound::SWEEP)
+    end
+
+    # Authorize, active Probe, the Sequencer and a minimize build a sender without naming one.
+    it "is bounded by default on a sender that names no bound" do
+      Gori::Fuzz::Sender.new(Gori::Fuzz::Origin.new("http", "127.0.0.1", 1), ungated_outbound,
+        false, false).sse.should eq(StreamBound::SWEEP)
     end
   end
 end

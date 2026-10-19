@@ -12,6 +12,15 @@ module Gori
         {"history delete", "Hard-delete captured flows by id (one or more), or every match of -q QL (needs --yes)"},
         {"history clear", "Delete ALL captured flows in the project (needs --yes)"},
       ])]
+      # Takes a leading `ls` / `list` off `positional` — the listing itself (#1625), not a search
+      # for "ls" — and THEN refuses a reserved verb the dispatcher did not see first
+      # (`--format=json delete 42`): `delete` is not QL, and searching for it would exit 0 with
+      # the flow still on disk.
+      def self.history_verb_error(positional : Array(String)) : String?
+        positional.shift if positional[0]?.in?("ls", "list")
+        reserved_query_verb_error(positional, "history", ["delete", "rm", "clear", "show"], "delete/rm, clear, show")
+      end
+
       private def self.cmd_history(args : Array(String)) : Nil
         case args.first?
         when "delete", "rm" then cmd_history_delete(args[1..])
@@ -365,16 +374,9 @@ module Gori
           p.on("--include-sensitive", "Emit Authorization/Cookie/Set-Cookie/API-key values in --format json's per-row headers instead of [REDACTED]") { include_sensitive = true }
           redact_options(p, redaction)
         end
-        # `--format=json delete 42` lands here because the dispatcher keys on args.first?
-        # (a leading `--project`/`--db` no longer does: `Run.hoist_target_flags`).
-        # `delete` is not QL; it is the discarded verb. Refuse it rather than search
-        # for the free-text "delete 42" and exit 0 with the flow still on disk.
-        if err = Run.reserved_query_verb_error(positional, "history",
-             ["delete", "rm", "clear", "show"], "delete/rm, clear, show")
+        if err = history_verb_error(positional)
           abort err
         end
-        # `history ls` / `history list` is the listing itself (#1625), not a search for "ls".
-        positional.shift if positional[0]?.in?("ls", "list")
         # Accept a positional QL too ("gori run history status:404" / "-status:404"),
         # mirroring the TUI's `/` bar — otherwise a positional query was silently dropped
         # and EVERY flow dumped.
@@ -1553,7 +1555,7 @@ module Gori
                       j.field "bytes", Base64.strict_encode(m.data)
                     elsif m.json
                       # A Connect `+json` payload or end-stream message: JSON text, not protobuf.
-                      j.field "json", String.new(plain).scrub
+                      MCP::Serialize.emit_connect_json(j, plain)
                     else
                       decoded = Protobuf.decode(plain)
                       j.field "protobuf" do

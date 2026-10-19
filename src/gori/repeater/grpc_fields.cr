@@ -6,8 +6,9 @@ require "./flow_request"
 
 module Gori::Repeater
   # The headless half of the Repeater's gRPC field edits (#1632): `gori run repeater send
-  # --grpc-field` and MCP `send_request{grpc_fields}` set or add fields on a request's single
-  # unary message through `Protobuf::Edit.set`, the function the TUI's add-field prompt calls.
+  # --grpc-field` and MCP `send_request{grpc_fields}` set, add or remove fields on a request's
+  # single unary message through `Protobuf::Edit.set`, the function the TUI's add-field prompt
+  # calls.
   #
   # The message is inflated when its frame is compressed and re-compressed with the request's
   # own `grpc-encoding` (#1629), then reframed with a length prefix that matches it — the edit
@@ -17,19 +18,23 @@ module Gori::Repeater
   module GrpcFields
     extend self
 
-    # `request` with every spec applied in order, or the sentence saying why not. No specs → the
-    # request itself.
+    # `request` with every spec applied in order, or the sentence saying why not. No specs, or
+    # specs that leave the message as it was → the request itself.
     def apply(request : Bytes, specs : Array(String)) : Bytes | String
       return request if specs.empty?
       unary = unary_message(request)
       return unary if unary.is_a?(String)
-      body, compressed, data, encoding = unary
+      body, compressed, plain, encoding = unary
       binding = Protobuf::Schemas.resolve(request_target(request), request: true)
+      data = plain
       specs.each do |spec|
         edited = Protobuf::Edit.set(data, binding.try(&.schema), binding.try(&.type), spec)
         return "#{spec.inspect}: #{edited}" if edited.is_a?(String)
         data = edited
       end
+      # A set that changed nothing sends the captured octets, as the TUI does (P7): re-compressing
+      # would swap the origin's deflate stream for gori's.
+      return request if data == plain
       if compressed
         data = Proxy::H2::Grpc.compress(encoding, data) || return "gori cannot re-compress with grpc-encoding #{encoding.inspect}"
       end

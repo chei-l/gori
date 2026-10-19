@@ -10,7 +10,8 @@ module Gori::Protobuf
   # the wire, so `is_admin`, `role` or `tenant_id` had no occurrence to replace and could not
   # be injected at all. Two shapes, one module, shared by every surface:
   #
-  #   * `set` — one `path=value` (`is_admin=true`, `profile.role=ADMIN`, `7:varint=1`). The
+  #   * `set` — one `path=value` (`is_admin=true`, `profile.role=ADMIN`, `7:varint=1`), or
+  #     `-path` to remove a field (`-profile.role`, `-7`) so "field omitted" is a test too. The
   #     Repeater's add-field prompt, `gori run repeater send --grpc-field` and MCP
   #     `send_request{grpc_fields}` all call it, so a spec means the same bytes everywhere.
   #   * `to_json` / `from_json` — the whole message as proto3 JSON (the TUI's JSON edit).
@@ -18,10 +19,13 @@ module Gori::Protobuf
   # ## What is copied, and what is re-encoded (P7)
   #
   # Both splice into the captured octets rather than serialize a message from scratch. `set`
-  # rebuilds only the field it names (and the containers on its path). `from_json` keeps every
+  # rebuilds only the field it names (and the containers on its path); a removal copies every
+  # other field, rebuilding only the containers it descends. `from_json` keeps every
   # field whose JSON value still encodes to what the wire held, byte for byte, and every field
   # the JSON cannot show — an undeclared number, a wire type the schema contradicts, the tail
-  # of a truncated capture. What it drops is a field the JSON showed and the operator deleted.
+  # of a truncated capture — inside each element of a repeated message too, which is merged
+  # into its own occurrence. What it drops is a field the JSON showed and the operator deleted;
+  # a key for a field the JSON left out is refused, since it would replace bytes nobody saw.
   #
   # Errors are sentences, as in `Encoder`: a typed key or value is the normal failure.
   module Edit
@@ -52,14 +56,54 @@ module Gori::Protobuf
     # an undeclared number the message does not already carry, and an override of the
     # declaration otherwise (sending a value as a type the schema did not declare is a test).
     # A path into a nested message the capture lacks creates it.
+    #
+    # A spec with no `=` that starts with `-` REMOVES the field instead: every occurrence of it,
+    # inside every occurrence of each message on its path (a parser merges those into one, so
+    # one left behind would still be read). A field the message does not carry is refused.
     def set(data : Bytes, schema : Schema?, type : Schema::MessageType?, spec : String) : Bytes | String
-      eq = spec.index('=') || return "#{spec.inspect} is not path=value"
-      path = spec[0, eq].strip
-      return "#{spec.inspect} names no field before the `=`" if path.empty?
+      eq = spec.index('=')
+      remove = eq.nil? && spec.lstrip.starts_with?('-')
+      return "#{spec.inspect} is not path=value (or -path to remove a field)" unless eq || remove
+      path = (eq ? spec[0, eq] : spec.lstrip[1..]).strip
+      return "#{spec.inspect} names no field" if path.empty?
       segs = path.split('.').map(&.strip)
       return "#{path.inspect} has an empty path segment" if segs.any?(&.empty?)
       return "#{path.inspect} nests #{segs.size} deep — past the #{MAX_PATH} a path takes" if segs.size > MAX_PATH
-      set_at(data, schema, type, segs, spec[(eq + 1)..])
+      return set_at(data, schema, type, segs, spec[(eq + 1)..]) if eq
+      remove_at(data, schema, type, segs) || "#{path} is not on this message — there is nothing to remove"
+    end
+
+    # `data` without the field `segs` names, or nil when no occurrence of it was found.
+    private def remove_at(data : Bytes, schema : Schema?, type : Schema::MessageType?,
+                          segs : Array(String)) : (Bytes | String)?
+      return "a removal takes no :type (#{segs[0].inspect})" if segs[0].includes?(':')
+      resolved = resolve_key(segs[0], type)
+      return resolved if resolved.is_a?(String)
+      number, defn = resolved
+      spans = Protobuf.field_spans(data)
+      hits = (0...spans.size).select { |i| spans[i].number == number }
+      return nil if hits.empty?
+      return rewrite(data, spans, hits.to_h { |i| {i, Bytes.empty} }) if segs.size == 1
+      inner_type = inner_type_of(defn, schema, "remove")
+      return inner_type if inner_type.is_a?(String)
+      edits = {} of Int32 => Bytes
+      hits.each do |i|
+        s = spans[i]
+        return "field #{number} is a #{s.wire.to_s.underscore} on the wire, not a message — there is nothing to remove inside it" unless s.wire.length_delimited?
+        inner = remove_at(data[s.body, s.body_size], schema, inner_type, segs[1..])
+        return inner if inner.is_a?(String)
+        edits[i] = retag(data, s, inner) if inner
+      end
+      edits.empty? ? nil : rewrite(data, spans, edits)
+    end
+
+    # `data` with the spans in `edits` replaced by their bytes; every other byte is copied.
+    private def rewrite(data : Bytes, spans : Array(Span), edits : Hash(Int32, Bytes)) : Bytes
+      io = IO::Memory.new(data.size)
+      spans.each_with_index { |s, i| io.write(edits[i]? || data[s.start, s.size]) }
+      tail = spans.last?.try(&.finish) || 0
+      io.write(data[tail, data.size - tail])
+      io.to_slice
     end
 
     private def set_at(data : Bytes, schema : Schema?, type : Schema::MessageType?,
@@ -84,12 +128,8 @@ module Gori::Protobuf
     private def set_inside(data : Bytes, spans : Array(Span), hits : Array(Int32), number : UInt32,
                            defn : Schema::FieldDef?, schema : Schema?, rest : Array(String),
                            value : String) : Bytes | String
-      inner_type = nil.as(Schema::MessageType?)
-      if d = defn
-        return "#{d.name} is a proto2 group — gori does not encode groups" if d.type.group?
-        return "#{d.name} is declared #{d.type_label}, not a message — there is nothing to set inside it" unless d.type.message?
-        inner_type = d.type_name.try { |tn| schema.try(&.message?(tn)) }
-      end
+      inner_type = inner_type_of(defn, schema, "set")
+      return inner_type if inner_type.is_a?(String)
       unless i = hits.last?
         inner = set_at(Bytes.empty, schema, inner_type, rest, value)
         return inner.is_a?(String) ? inner : splice(data, spans, hits, Encoder.length_delimited(number, inner))
@@ -98,6 +138,15 @@ module Gori::Protobuf
       return "field #{number} is a #{s.wire.to_s.underscore} on the wire, not a message — there is nothing to set inside it" unless s.wire.length_delimited?
       inner = set_at(data[s.body, s.body_size], schema, inner_type, rest, value)
       inner.is_a?(String) ? inner : splice(data, spans, [i], retag(data, s, inner))
+    end
+
+    # The message type a path descends into through `defn` (nil when undeclared, schemaless, or
+    # not in the loaded set), or why it cannot `verb` inside one: a group, or not a message.
+    private def inner_type_of(defn : Schema::FieldDef?, schema : Schema?, verb : String) : Schema::MessageType? | String
+      return nil unless d = defn
+      return "#{d.name} is a proto2 group — gori does not encode groups" if d.type.group?
+      return "#{d.name} is declared #{d.type_label}, not a message — there is nothing to #{verb} inside it" unless d.type.message?
+      d.type_name.try { |tn| schema.try(&.message?(tn)) }
     end
 
     # A length-delimited field rebuilt around new contents: its tag exactly as it arrived, then
@@ -293,9 +342,17 @@ module Gori::Protobuf
       return wanted if wanted.is_a?(String)
       shown_obj, shown = project(data, schema, type, depth)
       spans = Protobuf.field_spans(data)
-      chosen = {} of UInt32 => Bytes? # nil = keep the wire's occurrences verbatim
+      chosen = {} of UInt32 => Merged
       wanted.each do |n, (d, v)|
-        enc = merged_field(data, spans.select(&.number.==(n)), schema, d, v, shown_obj[d.name]?.as(JSON::Any?), depth)
+        on_wire = spans.select(&.number.==(n))
+        # A key the projection left out, though the field is on the wire (a packed run past
+        # `Lens::PACKED_MAX`, a wire type the schema contradicts): writing it would replace
+        # occurrences the operator never saw.
+        if !on_wire.empty? && !shown.includes?(n)
+          return "#{d.name} is on the wire in a form the JSON cannot show, so the editor left it out " \
+                 "and writing it would replace those bytes unseen — edit them with ^X instead"
+        end
+        enc = merged_field(data, on_wire, schema, d, v, shown_obj[d.name]?.as(JSON::Any?), depth)
         return "#{d.name}: #{enc}" if enc.is_a?(String)
         chosen[n] = enc
       end
@@ -315,24 +372,29 @@ module Gori::Protobuf
       wanted
     end
 
-    # What replaces one wanted field's occurrences (`on_wire`) — nil to keep them verbatim.
-    # `shown` is the capture's own JSON for it, when the projection showed it.
+    # What replaces one field's occurrences: nil keeps them verbatim, Bytes stand where the first
+    # of them did, and an Array holds one replacement per occurrence, each written in its place.
+    alias Merged = (Bytes | Array(Bytes))?
+
+    # What replaces one wanted field's occurrences (`on_wire`). `shown` is the capture's own
+    # JSON for it, when the projection showed it.
     private def merged_field(data : Bytes, on_wire : Array(Span), schema : Schema, d : Schema::FieldDef,
-                             v : JSON::Any, shown : JSON::Any?, depth : Int32) : Bytes? | String
+                             v : JSON::Any, shown : JSON::Any?, depth : Int32) : Merged | String
       packed = on_wire.all?(&.wire.length_delimited?)
       enc = encode_value(schema, d, v, packed, depth)
       return enc if enc.is_a?(String)
       # Untouched — the value still encodes to what the capture's own reading does — so the
       # capture's octets go out, whatever spelling (a padded varint, a 2 for true) they used.
       return nil if shown && encode_value(schema, d, shown, packed, depth) == enc
-      nested_edit(data, on_wire, schema, d, v, depth) || enc
+      nested_edit(data, on_wire, schema, d, v, shown, depth) || enc
     end
 
-    # A singular message edited where it stands, or nil when the field is not one. Merged into
-    # its own bytes, so what the JSON could not show inside it survives too.
+    # A message edited where it stands, or nil when the field is not one. Merged into its own
+    # bytes, so what the JSON could not show inside it survives too.
     private def nested_edit(data : Bytes, on_wire : Array(Span), schema : Schema, d : Schema::FieldDef,
-                            v : JSON::Any, depth : Int32) : (Bytes | String)?
-      return nil unless d.type.message? && !d.repeated && !v.raw.nil?
+                            v : JSON::Any, shown : JSON::Any?, depth : Int32) : Merged | String
+      return nil unless d.type.message? && !v.raw.nil?
+      return repeated_edit(data, on_wire, schema, d, v, shown, depth) if d.repeated
       # One that occurs twice is ONE message to a parser, which merges the occurrences; the JSON
       # showed only the last, so re-encoding it would drop the others.
       if on_wire.size > 1
@@ -347,26 +409,55 @@ module Gori::Protobuf
       inner.is_a?(String) ? inner : retag(data, s, inner)
     end
 
+    # A repeated message (a map is one too) edited element by element: the JSON's Nth element
+    # merged into the wire's Nth occurrence, where it stands, and an element the edit left alone
+    # keeps its octets (a padded length too). An array whose length changed cannot be paired,
+    # so it is encoded afresh (nil) — refused when that would drop bytes an occurrence holds
+    # beyond its JSON. `encode_value` has already checked every element's shape.
+    private def repeated_edit(data : Bytes, on_wire : Array(Span), schema : Schema, d : Schema::FieldDef,
+                              v : JSON::Any, shown : JSON::Any?, depth : Int32) : (Array(Bytes) | String)?
+      arr = v.as_a? || return nil
+      t = d.type_name.try { |tn| schema.message?(tn) } || return nil
+      if arr.size == on_wire.size && on_wire.all?(&.wire.length_delimited?)
+        return arr.map_with_index do |e, i|
+          s = on_wire[i]
+          o = e.as_h? || return nil
+          inner = merge(data[s.body, s.body_size], schema, t, o, depth + 1)
+          return "element #{i + 1}: #{inner}" if inner.is_a?(String)
+          inner == data[s.body, s.body_size] ? data[s.start, s.size] : retag(data, s, inner)
+        end
+      end
+      return nil if arr.empty?
+      was = shown.try(&.as_a?) || [] of JSON::Any
+      lossless = was.size == on_wire.size && on_wire.each_with_index.all? do |s, i|
+        encode_single(schema, d, was[i], depth) == data[s.start, s.size]
+      end
+      return nil if lossless
+      "the array has #{arr.size} elements where the wire has #{on_wire.size}, and they carry bytes " \
+      "the JSON cannot show — keep #{on_wire.size} to edit them in place, or edit the bytes with ^X"
+    end
+
     private def write_merged(data : Bytes, spans : Array(Span), shown : Set(UInt32),
                              wanted : Hash(UInt32, {Schema::FieldDef, JSON::Any}),
-                             chosen : Hash(UInt32, Bytes?)) : Bytes
+                             chosen : Hash(UInt32, Merged)) : Bytes
       io = IO::Memory.new(data.size)
-      emitted = Set(UInt32).new
+      emitted = Hash(UInt32, Int32).new(0)
       spans.each do |s|
         n = s.number
         if chosen.has_key?(n)
-          if enc = chosen[n]
-            io.write(enc) if emitted.add?(n)
-          else
-            io.write(data[s.start, s.size])
+          case enc = chosen[n]
+          in Nil          then io.write(data[s.start, s.size])
+          in Array(Bytes) then io.write(enc[emitted[n]])
+          in Bytes        then io.write(enc) if emitted[n] == 0
           end
+          emitted[n] += 1
         elsif !shown.includes?(n)
           io.write(data[s.start, s.size])
         end # shown, and no longer in the JSON: the operator deleted it
       end
       wanted.each_key do |n|
         next if spans.any? { |s| s.number == n }
-        chosen[n].try { |enc| io.write(enc) }
+        chosen[n].as?(Bytes).try { |enc| io.write(enc) }
       end
       tail = spans.last?.try(&.finish) || 0
       io.write(data[tail, data.size - tail])
@@ -385,6 +476,8 @@ module Gori::Protobuf
         arr.each_with_index do |e, i|
           t = scalar_text(d, e)
           return "element #{i + 1}: #{t[1]}" unless t[0]
+          # `encode_packed` splits its text on these, so `"1,2"` would go out as two elements.
+          return "element #{i + 1}: #{t[1].inspect} is one element, not a list" if t[1].strip.matches?(/[,\s]/)
           texts << t[1]
         end
         return Encoder.encode(schema, d, texts.join(","), packed: true)

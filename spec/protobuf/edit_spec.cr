@@ -16,6 +16,22 @@ end
 # `name: "bob"` — a User whose every other field sits at its proto3 default, off the wire.
 private BOB = Bytes[0x12, 0x03, 0x62, 0x6f, 0x62]
 
+# `t.List { repeated t.Item items = 1; }`, `t.Item { string name = 1; }` — a repeated message,
+# the shape a map field takes too.
+private def list_schema : {Gori::Protobuf::Schema, Gori::Protobuf::Schema::MessageType}
+  s = Gori::Protobuf::Schema.new
+  s.messages["t.Item"] = Gori::Protobuf::Schema::MessageType.new("t.Item",
+    {1_u32 => Gori::Protobuf::Schema::FieldDef.new(1_u32, "name", Gori::Protobuf::Schema::FieldType::String, nil, false)})
+  list = Gori::Protobuf::Schema::MessageType.new("t.List",
+    {1_u32 => Gori::Protobuf::Schema::FieldDef.new(1_u32, "items", Gori::Protobuf::Schema::FieldType::Message, "t.Item", true)})
+  s.messages["t.List"] = list
+  {s, list}
+end
+
+# items: [{name: "a", 99: 7}, {name: "b", 99: 8}] — field 99 undeclared, so the JSON hides it.
+private ITEMS = Bytes[0x0a, 0x06, 0x0a, 0x01, 0x61, 0x98, 0x06, 0x07,
+  0x0a, 0x06, 0x0a, 0x01, 0x62, 0x98, 0x06, 0x08]
+
 describe Gori::Protobuf::Edit do
   describe ".set" do
     it "replaces a field the message carries, copying the rest" do
@@ -65,6 +81,48 @@ describe Gori::Protobuf::Edit do
     it "keeps an undecodable tail after the fields it adds" do
       truncated = Bytes[0x12, 0x03, 0x62, 0x6f, 0x62, 0x1a, 0x09, 0x61] # field 3 claims 9 bytes, 1 arrived
       set(truncated, "active=true").should eq(Bytes[0x12, 0x03, 0x62, 0x6f, 0x62, 0x38, 0x01, 0x1a, 0x09, 0x61])
+    end
+  end
+
+  describe ".set with -path (remove)" do
+    it "removes a top-level field, copying every other byte" do
+      data = Base64.decode(DEMO_USER_B64)
+      role = Gori::Protobuf.field_spans(data).find(&.number.==(3)).not_nil!
+      want = IO::Memory.new
+      want.write(data[0, role.start])
+      want.write(data[role.finish, data.size - role.finish])
+      set(data, "-role").should eq(want.to_slice)
+      set(data, "-3", schema: false).should eq(want.to_slice)
+    end
+
+    it "removes inside a nested message, re-measuring only the containers on its path" do
+      # profile (4) { age (1) = 30, tags (2) = "red", "blue" }: both tags go, age stays
+      profile = Bytes[0x22, 0x0d, 0x08, 0x1e, 0x12, 0x03, 0x72, 0x65, 0x64, 0x12, 0x04, 0x62, 0x6c, 0x75, 0x65]
+      set(BOB + profile, "-profile.tags").should eq(BOB + Bytes[0x22, 0x02, 0x08, 0x1e])
+      set(BOB + profile, "-4.2", schema: false).should eq(BOB + Bytes[0x22, 0x02, 0x08, 0x1e])
+    end
+
+    it "removes every occurrence, inside every occurrence of a message on the path" do
+      # 7 = 1 twice, and profile { age = 30 } twice (a parser merges them into one)
+      twice = Bytes[0x38, 0x01] + BOB + Bytes[0x38, 0x01]
+      set(twice, "-active").should eq(BOB)
+      profiles = Bytes[0x22, 0x02, 0x08, 0x1e] + BOB + Bytes[0x22, 0x02, 0x08, 0x1f]
+      set(profiles, "-profile.age").should eq(Bytes[0x22, 0x00] + BOB + Bytes[0x22, 0x00])
+    end
+
+    it "refuses a field the message does not carry, and a malformed spec" do
+      set(BOB, "-role").as(String).should contain("not on this message")
+      set(BOB, "-profile.age").as(String).should contain("not on this message")
+      set(BOB, "-is_admin").as(String).should contain("declares no field \"is_admin\"")
+      set(BOB, "-7:varint").as(String).should contain("takes no :type")
+      set(BOB, "-").as(String).should contain("names no field")
+      set(BOB, "-name..x").as(String).should contain("empty path segment")
+      set(BOB, "-name.x").as(String).should contain("not a message")
+    end
+
+    it "keeps an undecodable tail after the fields it keeps" do
+      truncated = Bytes[0x38, 0x01, 0x12, 0x03, 0x62, 0x6f, 0x62, 0x1a, 0x09, 0x61]
+      set(truncated, "-active").should eq(Bytes[0x12, 0x03, 0x62, 0x6f, 0x62, 0x1a, 0x09, 0x61])
     end
   end
 
@@ -125,6 +183,50 @@ describe Gori::Protobuf::Edit do
         .should eq(Bytes[0x08, 0x1e, 0x50, 0xc8, 0x01])
       Gori::Protobuf::Edit.from_json(Bytes.empty, demo_schema, user_type, %({"id": 1.5}))
         .as(String).should contain("not an integer")
+    end
+
+    it "merges each element of a repeated message into its own occurrence, keeping what it hides" do
+      schema, list = list_schema
+      json = Gori::Protobuf::Edit.to_json(ITEMS, schema, list)
+      Gori::Protobuf::Edit.from_json(ITEMS, schema, list, json.sub(%("b"), %("c")))
+        .should eq(Bytes[0x0a, 0x06, 0x0a, 0x01, 0x61, 0x98, 0x06, 0x07, 0x0a, 0x06, 0x0a, 0x01, 0x63, 0x98, 0x06, 0x08])
+      # A new length cannot be paired with the wire's elements: refused rather than dropping 99.
+      Gori::Protobuf::Edit.from_json(ITEMS, schema, list, %({"items": [{"name": "a"}]}))
+        .as(String).should contain("keep 2 to edit them in place")
+      # …and encoded afresh when the elements hold nothing the JSON cannot show.
+      plain = Bytes[0x0a, 0x03, 0x0a, 0x01, 0x61]
+      Gori::Protobuf::Edit.from_json(plain, schema, list, %({"items": [{"name": "a"}, {"name": "b"}]}))
+        .should eq(Bytes[0x0a, 0x03, 0x0a, 0x01, 0x61, 0x0a, 0x03, 0x0a, 0x01, 0x62])
+    end
+
+    it "keeps an untouched element's bytes and each element where it stood" do
+      schema, list = list_schema
+      # items "a" behind a padded two-byte length, an undeclared field 2 between the two items.
+      data = Bytes[0x0a, 0x83, 0x00, 0x0a, 0x01, 0x61, 0x10, 0x01, 0x0a, 0x03, 0x0a, 0x01, 0x62]
+      json = Gori::Protobuf::Edit.to_json(data, schema, list)
+      Gori::Protobuf::Edit.from_json(data, schema, list, json.sub(%("b"), %("c")))
+        .should eq(Bytes[0x0a, 0x83, 0x00, 0x0a, 0x01, 0x61, 0x10, 0x01, 0x0a, 0x03, 0x0a, 0x01, 0x63])
+    end
+
+    it "refuses a key for a field on the wire that the JSON left out" do
+      # name (2) as a varint, which the schema's string contradicts; scores (6) packed past
+      # the lens's listing limit.
+      contradicted = Bytes[0x10, 0x05]
+      Gori::Protobuf::Edit.to_json(contradicted, demo_schema, user_type).should_not contain("name")
+      Gori::Protobuf::Edit.from_json(contradicted, demo_schema, user_type, %({"name": "x"}))
+        .as(String).should contain("cannot show")
+      run = Bytes.new(Gori::Protobuf::Lens::PACKED_MAX + 10, 0x01_u8)
+      long = Gori::Protobuf::Encoder.length_delimited(6_u32, run)
+      Gori::Protobuf::Edit.to_json(long, demo_schema, user_type).should_not contain("scores")
+      Gori::Protobuf::Edit.from_json(long, demo_schema, user_type, %({"scores": [1]}))
+        .as(String).should contain("cannot show")
+    end
+
+    it "refuses a packed element that would split into several" do
+      Gori::Protobuf::Edit.from_json(Bytes.empty, demo_schema, user_type, %({"scores": ["1,2"]}))
+        .as(String).should contain("one element, not a list")
+      Gori::Protobuf::Edit.from_json(Bytes.empty, demo_schema, user_type, %({"scores": ["1 2"]}))
+        .as(String).should contain("one element, not a list")
     end
 
     it "edits inside a nested message in place" do

@@ -89,7 +89,8 @@ class Gori::Proxy::H2::StreamGate
     # Streams whose response head has passed and whose response has not ended: credit for them
     # is not "before ownership", so it is not recorded.
     getter headed = Set(UInt32).new
-    # Bytes held in rule buffers across this direction's streams (`MAX_RULE_BUFFERED`).
+    # Bytes held in rule buffers across this direction's streams (`MAX_RULE_BUFFERED`): every
+    # byte its sender was credited for before gori wrote it, arriving or waiting in `sends`.
     property buffered = 0_i64
   end
 
@@ -102,6 +103,9 @@ class Gori::Proxy::H2::StreamGate
     getter head : Bytes?
     getter? declares_length : Bool
     property window : Int64
+    # The sender's window on this stream as it sees it: what it may still send gori. It opens
+    # where `window` does, drops as DATA arrives and grows with each refund.
+    property sender : Int64
     # The held head, while one is held. nil once it went out, or when it was never held.
     property slot : Slot?
     # DATA as it arrived, while the body is buffering.
@@ -113,12 +117,15 @@ class Gori::Proxy::H2::StreamGate
     # When a held head started waiting for its body (`expire_owned_heads_locked`).
     property held_since : Time::Instant?
     # DATA to send, each with the credit its sending returns to the sender (0 when that credit
-    # was already returned on arrival).
+    # was already returned on arrival, which keeps it in `Flow#buffered` until written).
     getter sends = [] of {Frame::Header, Int32}
+    # The credits in `sends`: what gori will still return the sender as it writes them.
+    property owed = 0_i64
     # Trailers, written once `sends` has drained.
     getter after = [] of {Frame::Header, Assembler::HeadBlock?}
 
     def initialize(@stream_id, @host, @request, @head, @declares_length, @window)
+      @sender = @window
     end
   end
 
@@ -132,7 +139,7 @@ class Gori::Proxy::H2::StreamGate
     return nil unless rw && fc && head
     return nil if block.first.end_stream? || block.first.frame_type != Frame::Type::Headers
     host = @heads.host_of(block)
-    return nil unless body_rule_for?(rw, block.fields, host)
+    return nil unless body_rule_for?(rw, block.fields, host, block.stream_id)
     return nil if streaming?(block.fields) || unbufferable?(block, head)
     len = declared_body_length(block.fields)
     return nil if @ordered && unholdable_request?(block, len)
@@ -154,14 +161,19 @@ class Gori::Proxy::H2::StreamGate
     true
   end
 
-  private def body_rule_for?(rw : Proxy::HeadRewriter, fields : Array(HPACK::Field), host : String) : Bool
+  private def body_rule_for?(rw : Proxy::HeadRewriter, fields : Array(HPACK::Field), host : String,
+                             stream_id : UInt32) : Bool
     if @ordered
       # An extended CONNECT (RFC 8441) carries a tunnel, not an entity.
       HeadCodec.pseudo_of(fields, ":method") != "CONNECT" && rw.rewrites_request_body_for_host?(host)
     else
       status = HeadCodec.pseudo_of(fields, ":status").try(&.to_i?)
-      # An interim 1xx is not the message.
-      !(status && status < 200) && rw.rewrites_response_body_for_host?(host)
+      # An interim 1xx is not the message, and the answer to a CONNECT opens the tunnel: its
+      # 200 declares no length and never ends while the socket lives. A request the assembler
+      # is not tracking (past `Assembler::MAX_LIVE_STREAMS`) may be that CONNECT, so it is
+      # not owned either.
+      !(status && status < 200) && rw.rewrites_response_body_for_host?(host) &&
+        !@assembler.request_ref(stream_id).try(&.method).in?(nil, "CONNECT")
     end
   end
 
@@ -181,13 +193,58 @@ class Gori::Proxy::H2::StreamGate
     true
   end
 
-  # `plan_body`'s answer for a head `defer?` is about to place, or nil. A held stream is the
-  # hold's: the operator edits that body, so the rule says it stood aside.
-  private def body_for(block : HeadRewrite::Block, held : Bool) : Owned?
-    own = plan_body(block, take_pre_credit(block))
-    return own unless own && held
-    skip_body(block.stream_id, "it was held at intercept, and the hold owns its body")
-    nil
+  # Whether a body rule's head waits for its body: it declares the length the rewrite must keep
+  # true, and no intercept hold owns the stream (that one runs the rule itself).
+  private def waits_for_body?(own : Owned?, held : Held?) : Bool
+    !held && !!own.try(&.declares_length?)
+  end
+
+  # A held stream's body, once the hold has buffered it whole, with the body rule run over it
+  # first — h1's order (`ClientConn#handle_held_request`), so the operator sees and forwards
+  # the rewrite. The hold sends it as an edit's body (`write_rebuilt`), within the windows the
+  # SENDER was given, so a rewrite that grows past what the receiver is sure to allow is not
+  # applied: the receiver's stream window is the request's initial one, and for a response
+  # only what the sender itself was granted is known.
+  private def rule_held_body_locked(slot : Slot) : Bytes
+    body = body_of(slot)
+    own = slot.rule
+    rw = @body_rewriter
+    return body unless own && rw && !body.empty?
+    rewritten, hits = run_body_rule(rw, own, body)
+    return body if rewritten == body
+    room = own.request? ? @flow.try(&.initial) || DEFAULT_WINDOW : body.size.to_i64
+    if rewritten.size > body.size && rewritten.size > room
+      skip_body(own.stream_id, "it was held at intercept, and the rewrite would have grown it past the #{room}-byte window its receiver is known to allow")
+      return body
+    end
+    note_rewrite(own, slot, hits, body, rewritten)
+    slot.rebuilt = rewritten
+  end
+
+  # The body rules over one owned body, their hits settled. An empty body runs no rule, as on
+  # h1 (`ClientConn#apply_body_rewrite`): a `^` pattern would otherwise invent one for every
+  # bodiless message.
+  private def run_body_rule(rw : Proxy::HeadRewriter, own : Owned, body : Bytes) : {Bytes, Array(Store::RuleRef)}
+    hits = [] of Store::RuleRef
+    rewritten = if body.empty?
+                  body
+                elsif own.request?
+                  rw.rewrite_request_body(body, own.host, hits)
+                else
+                  rw.rewrite_response_body(body, own.host, hits)
+                end
+    rw.settle_hits(hits, 0, body, rewritten) { |b| b }
+    {rewritten, hits}
+  end
+
+  # A rewrite the rules made: recorded on the flow, and a held head's `content-length` made
+  # to describe the new body.
+  private def note_rewrite(own : Owned, slot : Slot?, hits : Array(Store::RuleRef), body : Bytes,
+                           rewritten : Bytes) : Nil
+    @assembler.note_body_rewrite(own.stream_id, own.request?, hits, own.head, body)
+    if slot && (pending = slot.pending)
+      slot.decided = @heads.reencode(pending, with_length(pending.fields, rewritten.size))
+    end
   end
 
   # SSE and gRPC never end on a schedule gori can wait for: a body rule leaves them streaming,
@@ -359,8 +416,10 @@ class Gori::Proxy::H2::StreamGate
   end
 
   private def own_data_locked(fc : Flow, own : Owned, f : Frame::Header) : Nil
+    own.sender -= f.payload.size
     if own.spilled?
       own.sends << {f, f.payload.size}
+      own.owed += f.payload.size
       own.complete = true if f.end_stream?
       pump_owned_locked(fc, own)
       return
@@ -369,7 +428,7 @@ class Gori::Proxy::H2::StreamGate
     own.size += f.payload.size
     fc.buffered += f.payload.size
     own.held_since = Time.instant if own.held_since # a body still arriving has not stalled
-    refund_locked(fc, own.stream_id, f.payload.size, f.end_stream?)
+    refund_locked(fc, own, f.payload.size, f.end_stream?)
     # A PADDED frame carries bytes only `Assembler#data_block` knows how to strip, so the body
     # is one gori will not rewrite — the same call `note_body_frame` makes for a hold.
     if f.padded?
@@ -391,7 +450,7 @@ class Gori::Proxy::H2::StreamGate
     own.spilled = true
     own.complete = true if own.arrived.last?.try(&.end_stream?)
     own.arrived.each { |f| own.sends << {f, 0} }
-    clear_arrived(fc, own)
+    own.arrived.clear
     if slot = own.slot
       # The held head goes as it arrived, with the length it declared, which is now true.
       slot.ready = true
@@ -415,29 +474,17 @@ class Gori::Proxy::H2::StreamGate
       f.payload.copy_to(entity + at)
       at += f.payload.size
     end
-    hits = [] of Store::RuleRef
-    # An empty body runs no rule, as on h1 (`ClientConn#apply_body_rewrite`): a `^` pattern
-    # would otherwise invent one for every bodiless message.
-    rewritten = if entity.empty?
-                  entity
-                elsif own.request?
-                  rw.rewrite_request_body(entity, own.host, hits)
-                else
-                  rw.rewrite_response_body(entity, own.host, hits)
-                end
-    rw.settle_hits(hits, 0, entity, rewritten) { |b| b }
+    rewritten, hits = run_body_rule(rw, own, entity)
     if rewritten == entity
       own.arrived.each { |f| own.sends << {f, 0} }
     else
       # False when trailers end the message: the flag stays on whatever ended it.
       ends = own.arrived.last?.try(&.end_stream?) || false
       data_frames(own.stream_id, rewritten, ends).each { |f| own.sends << {f, 0} }
-      @assembler.note_body_rewrite(own.stream_id, own.request?, hits, own.head, entity)
-      if (slot = own.slot) && (pending = slot.pending)
-        slot.decided = @heads.reencode(pending, with_length(pending.fields, rewritten.size))
-      end
+      fc.buffered += rewritten.size - entity.size
+      note_rewrite(own, own.slot, hits, entity, rewritten)
     end
-    clear_arrived(fc, own)
+    own.arrived.clear
     if slot = own.slot
       slot.ready = true
       @deferred_cross.concat(drain_locked)
@@ -447,11 +494,6 @@ class Gori::Proxy::H2::StreamGate
   private def late?(own : Owned, now : Time::Instant) : Bool
     since = own.held_since
     !own.slot.nil? && !since.nil? && now - since >= hold_wait_deadline
-  end
-
-  private def clear_arrived(fc : Flow, own : Owned) : Nil
-    fc.buffered -= own.size unless own.arrived.empty?
-    own.arrived.clear
   end
 
   private def with_length(fields : Array(HPACK::Field), size : Int32) : Array(HPACK::Field)
@@ -487,15 +529,19 @@ class Gori::Proxy::H2::StreamGate
       if size > 0 && size > room
         break if f.padded? || room <= 0
         piece = room.to_i32
-        own.sends[0] = {Frame::Header.new(f.type, f.flags, f.stream_id, f.payload[piece..]), 0}
+        # A credit owed is the frame's size, so each piece returns its own share of it.
+        own.sends[0] = {Frame::Header.new(f.type, f.flags, f.stream_id, f.payload[piece..]), Math.max(credit - piece, 0)}
         f = Frame::Header.new(f.type, 0_u8, f.stream_id, f.payload[0, piece])
+        credit = Math.min(credit, piece)
       else
         own.sends.shift
       end
       write(f, nil)
       own.window -= f.payload.size
       fc.debt += f.payload.size
-      refund_locked(fc, own.stream_id, credit, f.end_stream?) if credit > 0
+      fc.buffered -= f.payload.size if credit == 0
+      own.owed -= credit
+      refund_locked(fc, own, credit, f.end_stream?) if credit > 0
     end
     return unless own.sends.empty? && own.complete?
     own.after.each { |(f, pre)| write(f, pre) }
@@ -504,9 +550,11 @@ class Gori::Proxy::H2::StreamGate
 
   # Credit the sender for `n` bytes this gate took off it. Not on the stream for the frame that
   # ended it: the sender is done with that window.
-  private def refund_locked(fc : Flow, stream_id : UInt32, n : Int32, last : Bool) : Nil
+  private def refund_locked(fc : Flow, own : Owned, n : Int32, last : Bool) : Nil
     @swallowed += n
-    fc.refunds[stream_id] += n unless last || n <= 0
+    return if last || n <= 0
+    fc.refunds[own.stream_id] += n
+    own.sender += n
   end
 
   # The sender reset an owned stream. Its unsent credit is owed back; the RST reaches the far
@@ -527,8 +575,11 @@ class Gori::Proxy::H2::StreamGate
   end
 
   private def forget_owned(fc : Flow, own : Owned) : Nil
-    own.sends.each { |(_, credit)| @swallowed += credit }
-    clear_arrived(fc, own)
+    own.sends.each do |(f, credit)|
+      credit > 0 ? (@swallowed += credit) : (fc.buffered -= f.payload.size)
+    end
+    fc.buffered -= own.arrived.sum(&.payload.size)
+    own.arrived.clear
     fc.owned.delete(own.stream_id)
   end
 
@@ -657,7 +708,12 @@ class Gori::Proxy::H2::StreamGate
     elsif own = fc.owned[f.stream_id]?
       own.window += n
       pump_owned_locked(fc, own)
-      nil
+      # Refunds keep a sender going only once it has a window to send in. One opened at zero
+      # (SETTINGS_INITIAL_WINDOW_SIZE 0, credit granted only after the head) gets this credit —
+      # but not while frames it sent wait in `sends`: their refunds are its window already.
+      return nil if own.sender + own.owed > 0
+      own.sender += n
+      f
     else
       note_pre_credit(fc, f.stream_id, n) unless @ordered
       f
@@ -682,7 +738,10 @@ class Gori::Proxy::H2::StreamGate
         value = IO::ByteFormat::BigEndian.decode(UInt32, f.payload[at + 2, 4]).to_i64
         delta = value - fc.initial
         fc.initial = value
-        fc.owned.each_value { |own| own.window += delta }
+        fc.owned.each_value do |own|
+          own.window += delta
+          own.sender += delta
+        end
       end
       at += 6
     end

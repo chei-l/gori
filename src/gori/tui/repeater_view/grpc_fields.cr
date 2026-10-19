@@ -297,17 +297,19 @@ class Gori::Tui::RepeaterView
     plain = grpc_plain_payload
     return "the compressed payload did not inflate: #{plain}" if plain.is_a?(String)
     edited = Protobuf::Edit.from_json(plain, b.schema, b.type, text)
-    if edited.is_a?(String)
+    # `store_grpc_plain` can refuse too (a codec gori cannot write), and the text survives that.
+    err = edited.is_a?(String) ? edited : (edited == plain ? nil : store_grpc_plain(edited))
+    if err
       @grpc_json_draft = text
-      return "JSON edit refused: #{edited} — reopen it to fix (your text is kept)"
+      return "JSON edit refused: #{err} — reopen it to fix (your text is kept)"
     end
     @grpc_json_draft = nil
-    edited == plain ? nil : store_grpc_plain(edited)
   end
 
-  # Set or ADD one field from a `path=value` spec — the same `Protobuf::Edit.set` that
-  # `gori run repeater send --grpc-field` and MCP `grpc_fields` call. Names resolve through the
-  # loaded `.proto` when there is one; numbers always do. The refusal sentence, or nil.
+  # Set or ADD one field from a `path=value` spec, or remove one with `-path` — the same
+  # `Protobuf::Edit.set` that `gori run repeater send --grpc-field` and MCP `grpc_fields` call.
+  # Names resolve through the loaded `.proto` when there is one; numbers always do. The refusal
+  # sentence, or nil.
   def grpc_add_field(spec : String) : String?
     plain = grpc_plain_payload
     return "the compressed payload did not inflate: #{plain}" if plain.is_a?(String)

@@ -511,6 +511,28 @@ describe "RepeaterView gRPC whole-message edits (#1632)" do
     end
   end
 
+  it "keeps the JSON text when re-compressing the edit is refused" do
+    with_demo_schema do
+      grpc_tmp_store do |store|
+        head = "POST /demo.Users/GetUser HTTP/2\r\nHost: api.test\r\ncontent-type: application/grpc\r\ngrpc-encoding: gzip\r\n\r\n"
+        id = store.insert_flow(Gori::Store::CapturedRequest.new(
+          created_at: 1_i64, scheme: "https", host: "api.test", port: 443,
+          method: "POST", target: "/demo.Users/GetUser", http_version: "HTTP/2",
+          head: head.to_slice,
+          body: Gori::Proxy::H2::Grpc.frame(true, Gori::Proxy::H2::Grpc.compress("gzip", get_user_request("bob")).not_nil!),
+          source: Gori::FlowSource::Kind::Proxy))
+        view = RepeaterView.new
+        view.load_grpc(store.get_flow(id).not_nil!)
+        # A codec gori inflates nothing with and writes nothing in: the store step refuses.
+        view.@editor.set_text(view.@editor.wire_text.sub("grpc-encoding: gzip", "grpc-encoding: br"))
+        view.grpc_edit_begin(schema: true).should be_nil
+        view.grpc_json_text
+        view.grpc_json_apply(%({"name": "admin"})).not_nil!.should contain("cannot re-compress")
+        view.grpc_json_text.should eq(%({"name": "admin"}))
+      end
+    end
+  end
+
   it "needs a descriptor set for JSON, but adds a field by number without one" do
     Schemas.clear
     grpc_tmp_store do |store|
@@ -541,6 +563,20 @@ describe "RepeaterView gRPC whole-message edits (#1632)" do
       bytes[bytes.size - sent_payload(view).size - 5].should eq(0x01_u8) # flag kept
       Gori::Proxy::H2::Grpc.inflate("gzip", sent_payload(view)).should eq(Bytes[0x0A, 0x03, 0x62, 0x6f, 0x62, 0x38, 0x01])
     end
+  end
+
+  # `--grpc-field` and MCP `grpc_fields` hand `Edit.set` the spec as typed, so `name=admin `
+  # sends the trailing space. The add-field prompt must too: not `name`, which strips it.
+  # `Runner.new` owns a terminal, so the prompt's wiring is read from source.
+  it "adds a field from the prompt's text as typed, as the CLI and MCP do" do
+    Schemas.clear
+    grpc_tmp_store do |store|
+      view = grpc_view(store, get_user_request("bob"))
+      view.grpc_add_field("1=admin ").should be_nil
+      sent_payload(view).should eq(get_user_request("admin "))
+    end
+    src = File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui", "runner", "repeater.cr"))
+    src.should contain("view.grpc_add_field(np.value)")
   end
 end
 

@@ -90,6 +90,24 @@ describe "MCP wordlist catalog" do
         l["truncated"].as_bool.should be_true
       end
     end
+
+    # #1649: a name runs to 200 bytes, so a full catalog outgrows the reply budget; `offset`
+    # pages the rest, each list exactly once.
+    it "holds the listing to the reply budget and pages it by offset" do
+      with_wordlist_home do
+        names = (0...600).map { |i| "#{i.to_s.rjust(3, '0')}#{"n" * 190}.txt" }
+        names.each { |n| Catalog.save_values(n, ["x"]) }
+        t = unbound_tools
+        first = ok(t, "list_wordlists", %({"limit":1000}))
+        first["cut_by"].as_s.should eq("bytes")
+        first["truncated"].as_bool.should be_true
+        first.to_json.bytesize.should be < Gori::MCP::Tools::REPLY_ROWS_BUDGET + 4096
+        seen = mcp_page_rows("wordlists", "truncated") do |o|
+          ok(t, "list_wordlists", %({"limit":1000,"offset":#{o}}))
+        end.map(&.["name"].as_s)
+        seen.should eq(names)
+      end
+    end
   end
 
   describe "save_wordlist" do
