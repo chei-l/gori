@@ -1,3 +1,5 @@
+require "base64"
+require "json"
 require "./ws_engine"
 
 module Gori
@@ -47,6 +49,94 @@ module Gori
         def reply? : Bool
           message.direction == "in" && !keepalive
         end
+
+        def to_json(j : JSON::Builder, *, mask_secrets : Bool = false) : Nil
+          WsSession.emit_message_json(j, @message, seq: @seq, auto: @auto, mask_secrets: mask_secrets)
+        end
+      end
+
+      # RFC 6455 opcode → frame type name, so a caller reads text/binary/ping/pong/
+      # close directly instead of decoding the numeric opcode.
+      def self.frame_type(opcode : Int32) : String
+        case opcode
+        when 0x0 then "continuation"
+        when 0x1 then "text"
+        when 0x2 then "binary"
+        when 0x8 then "close"
+        when 0x9 then "ping"
+        when 0xA then "pong"
+        else          "opcode-#{opcode}"
+        end
+      end
+
+      # Who wrote a WebSocket message (`client` vs `target`).
+      def self.origin(direction : String) : String
+        direction == "out" ? "client" : "target"
+      end
+
+      # One transcript row of a WebSocket exchange as a JSON object — shared by MCP's
+      # `send_websocket` / `get_job` (`ws_session_status`) and `gori run repeater ws --format json`.
+      # `authored` is the operator's frame before expansion, for an "out" row whose source is
+      # known; `seq` / `auto` are a live session's (`WsSession::Entry`). `mask_secrets` is set by
+      # the MCP surface so project secrets do not reach the model in clear text or base64.
+      def self.emit_message_json(j : JSON::Builder, message : WsEngine::Message,
+                                 authored : Store::WsOutMessage? = nil, *, seq : Int64? = nil,
+                                 auto : Bool = false, mask_secrets : Bool = false) : Nil
+        j.object do
+          j.field "seq", seq if seq
+          # A heartbeat reply the session wrote by itself, not the agent.
+          j.field "auto_reply", true if auto
+          j.field "direction", message.direction
+          j.field "opcode", message.opcode
+          j.field "origin", origin(message.direction)
+          j.field "type", frame_type(message.opcode)
+          # What was actually FRAMED, not just what was meant. An agent driving a
+          # §5.1/§5.2/§5.4 test has to be able to read back that the unmasked frame,
+          # the RSV1 bit or the lying length header really went out — a transcript
+          # that only echoes the payload is asking to be taken on trust.
+          j.field "frame", Store::WsOutMessage.new(message.opcode, message.payload, message.shape).shape_label(message.direction == "out")
+          if message.opcode == Proxy::WS::OP_CLOSE.to_i && (code = WsEngine.close_status(message.payload))
+            j.field "close_code", code
+            reason = message.payload[2, message.payload.size - 2]
+            j.field "close_reason", String.new(reason).scrub unless reason.empty?
+          end
+          emit_payload_json(j, message, authored, mask_secrets)
+        end
+      end
+
+      private def self.emit_payload_json(j : JSON::Builder, message : WsEngine::Message,
+                                         authored : Store::WsOutMessage?, mask_secrets : Bool) : Nil
+        # ONE masked buffer feeds both renderings, so they cannot disagree.
+        # They did: `payload` ran through `mask_secrets` while `payload_base64`
+        # beside it was a bare encode of the raw bytes — and since masking is
+        # the exact inverse of the expansion, the same object reported the
+        # STORED spelling in one field and printed the substituted value in the
+        # clear in the next (`bad\xff\xfeWHEREVAL`, base64, unmasked). Masking a
+        # value in one rendering and not another is not masking it.
+        bytes = mask_secrets ? Env.mask_secrets(String.new(message.payload)).to_slice : message.payload
+        if message.opcode == Proxy::WS::OP_TEXT.to_i
+          s = String.new(bytes)
+          j.field "payload", s.scrub
+          # JSON-RPC has no way to carry a byte that is not valid UTF-8, so
+          # `payload` above is U+FFFD-substituted for exactly the payload an
+          # §8.1/§5.6 test is about. The real bytes go beside it instead of
+          # being unreadable on every surface (they are in the BLOB column).
+          j.field "payload_base64", Base64.strict_encode(bytes) unless s.valid_encoding?
+        else
+          j.field "binary", true
+          j.field "payload_base64", Base64.strict_encode(bytes)
+        end
+        # Only when it FIRED — the same rule `request_line_rewritten` follows
+        # (`send_request`): gori changed the operator's bytes, so the surface
+        # reporting the send has to say so. Masking makes the change invisible
+        # in `payload` on its own, because it maps the substituted value back to
+        # the `$NAME` that produced it, and the result then reads exactly like a
+        # byte-exact replay. The AUTHORED form goes beside it so an agent can see
+        # both ends of the substitution rather than infer one.
+        return unless authored && authored.payload != message.payload
+        j.field "payload_expanded", true
+        raw = String.new(authored.payload)
+        j.field "payload_authored", (mask_secrets ? Env.mask_secrets(raw) : raw).scrub
       end
 
       # What `open` produced: the session when the 101 came back, and always the handshake as
@@ -63,6 +153,11 @@ module Gori
       getter close_code : Int32?
       # Why the session ended; nil while open.
       getter close_reason : String?
+      # True when `close_reason` is a transport/protocol failure, cap violation, or mid-session
+      # gate refusal rather than an operator close, server CLOSE, or clean EOF.
+      getter? close_abnormal = false
+      # True once `close` has started tearing the session down on the operator's behalf.
+      getter? closing = false
       # WHEN the session ended — the moment `end_with` first ran, not when a surface first
       # noticed (#1630). Set with `close_reason`, so a reader that sees `closed?` has it too.
       getter closed_at : Time?
@@ -82,7 +177,6 @@ module Gori
       @done = Channel(Nil).new
       # One slot, fed without blocking, so the reader never waits on an absent listener.
       @signal = Channel(Nil).new(1)
-      @closing = false
       @sent_close = false
       # The inbound message being reassembled (§5.4).
       @assembling = IO::Memory.new
@@ -192,7 +286,7 @@ module Gori
         # fiber (the MCP worker) and must not block; the reader exits when `@io` closes.
         if gate = @gate
           if reason = gate.call
-            end_with("a scope or Sandbox change refused a mid-session send (#{reason}); the session was closed")
+            end_with("a scope or Sandbox change refused a mid-session send (#{reason}); the session was closed", abnormal: true)
             @io.close rescue nil
             notify
             return "the send was refused: #{reason}; the session was closed"
@@ -278,7 +372,7 @@ module Gori
         nil
       rescue ex : IO::Error | OpenSSL::Error
         reason = "the write failed (#{ex.message.presence || ex.class.name})"
-        end_with("#{reason}; the session was closed")
+        end_with("#{reason}; the session was closed", abnormal: true)
         @io.close rescue nil
         reason
       end
@@ -320,16 +414,16 @@ module Gori
           if header.len > Proxy::WS::MAX_FRAME
             # Its payload stays unread, so the stream is out of step: the session ends.
             break end_with("a server frame declared #{header.len} bytes, over the " \
-                           "#{Proxy::WS::MAX_FRAME // (1024 * 1024)} MiB per-frame cap")
+                           "#{Proxy::WS::MAX_FRAME // (1024 * 1024)} MiB per-frame cap", abnormal: true)
           end
           frame = Proxy::WS.read_body(@io, header)
-          break end_with("the connection ended mid-frame") unless frame
+          break end_with("the connection ended mid-frame", abnormal: true) unless frame
           break unless on_frame(frame)
         end
       rescue ex : IO::Error | OpenSSL::Error
-        end_with("the connection failed (#{ex.message.presence || ex.class.name})")
+        end_with("the connection failed (#{ex.message.presence || ex.class.name})", abnormal: true)
       rescue ex
-        end_with("the session reader failed (#{ex.message.presence || ex.class.name})")
+        end_with("the session reader failed (#{ex.message.presence || ex.class.name})", abnormal: true)
       ensure
         flush_pending
         end_with("the connection ended")
@@ -340,9 +434,10 @@ module Gori
 
       # The first reason wins: an operator's close or a server CLOSE is not overwritten by the
       # EOF that follows it.
-      private def end_with(reason : String) : Nil
+      private def end_with(reason : String, abnormal : Bool = false) : Nil
         return if @close_reason
         @close_reason = reason
+        @close_abnormal = abnormal
         @closed_at = Time.utc
       end
 
@@ -386,7 +481,7 @@ module Gori
         @shape.note(frame)
         @assembling.write(frame.payload)
         if @assembling.bytesize > MAX_BYTES
-          end_with("a server message passed the #{MAX_BYTES // (1024 * 1024)} MiB cap; the session was closed")
+          end_with("a server message passed the #{MAX_BYTES // (1024 * 1024)} MiB cap; the session was closed", abnormal: true)
           return false
         end
         return true unless frame.fin?
