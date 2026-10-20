@@ -53,6 +53,11 @@
 - Authorize: a flow id that names no flow is listed as skipped (`no flow with that id`) by `gori run authorize` and MCP `authorize_start` instead of being dropped silently (#1684)
 - Links: `gori run links` prints each link's ref kind and id (`[hist] flow #2 GET 127.0.0.1:8080/err`), a flow link's label keeps a non-default port, and the issues JSON export's `links` rows carry `id` and `ref_kind` beside `kind` (#1685)
 - Issues: an issue's host and seed flow can be changed after create with `gori run issues update --host` / `--flow N` (empty clears) and MCP `update_issue` `host` / `flow_id`; the old seed flow stays linked as removable evidence (#1686)
+- MCP: a `--db` or `GORI_MCP_DB` file that does not exist leaves the server unbound with a `bind_error`, read-only or not, instead of creating and migrating an empty database there, and `gori mcp --install-*` notes a `--db` that does not exist yet (#1667)
+- CLI: `fuzz`, `mine` and `sequence` with `--request` or stdin read the project `GORI_PROJECT` names, its env vars, host overrides, scope and Sandbox included, the same as `--project`, instead of sending unscoped; an unknown or empty one is refused, as on every other command, and `wordlist save --payload-from` honours it too (#1669)
+- CLI: `gori run project env set KEY --value-stdin` reads the value from a pipe or a redirect, never a terminal, so a token stays off the argument vector (#1702)
+- CLI: a `--project`, `GORI_PROJECT`, `project switch` or `project delete` name that matches nothing lists the five closest projects with their short ids and how many more there are, instead of every project name on one line (#1705)
+- CLI: `gori run project rename OLD NEW` changes a project's display name, keeping its slug and short id, and `gori run project describe NAME TEXT` sets its description, or removes it with `--clear` (#1703)
 
 ## v0.8.1
 

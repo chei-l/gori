@@ -108,6 +108,8 @@ gori run <subcommand> [verb] [options]
 | `grpc [schema]` · `reflect` · `forget` | gRPC `.proto` 렌즈: 무엇이 로드됐는지 보기, 서버 리플렉션으로 디스크립터 받기, 캐시된 대상 버리기 |
 | `project [list]` | 캡처된 트래픽이 있는 프로젝트 목록 (`--all`이면 전부) |
 | `project create <name>` | 이름으로 프로젝트 생성 (같은 이름이면 다시 열기) |
+| `project rename <name> <new-name>` | 프로젝트 표시 이름 변경 |
+| `project describe <name> <text>` · `--clear` | 프로젝트 설명 설정 또는 제거 |
 | `project switch <name>` (`use`) · `--clear` | `--project` 없는 모든 명령이 읽을 프로젝트 고정 |
 | `project export <name>` | 압축된 WAL 안전 `.gori` 프로젝트 아카이브 저장 |
 | `project import <archive>` | 프로젝트 아카이브를 새 프로젝트로 추가 |
@@ -699,7 +701,7 @@ gori run fuzz save 42 --auto --preset sqli
 gori run fuzz save --request request.txt --target https://api.example.com --project acme --payloads a,b
 ```
 
-파일/stdin에서 저장할 때는 `--project`나 `--db`가 필요합니다. 프로젝트를 지정하지 않은 스윕을 가장 최근 프로젝트에 조용히 써넣지 않기 때문입니다. `--record-history`는 이와 별개로 남습니다. 저장된 결과 집합이 아니라 History 플로우를 제어합니다.
+파일/stdin에서 저장할 때는 `--project`, `--db`, `GORI_PROJECT` 중 하나가 필요합니다. 프로젝트를 지정하지 않은 스윕을 가장 최근 프로젝트에 조용히 써넣지 않기 때문입니다. `--record-history`는 이와 별개로 남습니다. 저장된 결과 집합이 아니라 History 플로우를 제어합니다.
 
 | 명령 | 설명 |
 |------|------|
@@ -1631,7 +1633,25 @@ gori run project create api-test --format json
 | `--description=TEXT` | 프로젝트 설정에 저장됩니다 |
 | `--format=FMT` | `text`(기본) 또는 `json` |
 
-이미 있는 이름은 오류가 아니라 그 프로젝트를 다시 여는 것으로 처리하며, `--format json`은 `"created": false`로 알려 줍니다. 다시 열 때 저장된 표시 이름은 마지막 create의 대소문자로 갱신되고, `--description`을 주면 기존 설명을 덮어씁니다. 새 이름이 이미 다른 프로젝트의 디렉터리 slug나 짧은 id라면 거부합니다. 그 이름으로는 `--project`가 새로 만든 프로젝트에 닿을 수 없기 때문입니다.
+이미 있는 이름은 오류가 아니라 그 프로젝트를 다시 여는 것으로 처리하며, `--format json`은 `"created": false`로 알려 줍니다. 다시 열 때 저장된 표시 이름은 그대로 두고(`project rename`으로 바꿉니다), 비어 있지 않은 `--description`을 주면 기존 설명을 덮어씁니다(설명을 지우려면 `project describe --clear`). 새 이름이 이미 다른 프로젝트의 디렉터리 slug나 짧은 id라면 거부합니다. 그 이름으로는 `--project`가 새로 만든 프로젝트에 닿을 수 없기 때문입니다.
+
+#### project rename {#project-rename}
+
+프로젝트의 표시 이름을 바꿉니다. 디렉터리 slug와 짧은 id는 그대로라서 어느 쪽으로 준 `--project`도, 열려 있는 캡처도, `project switch` 고정도 계속 같은 프로젝트를 가리킵니다. 새 이름이 이미 다른 프로젝트의 slug나 짧은 id라면 `create`처럼 거부합니다.
+
+```bash
+gori run project rename api-test "API test (staging)"
+gori run project rename a1b2c3 "API test"      # 짧은 id로
+```
+
+#### project describe {#project-describe}
+
+프로젝트 설명을 설정하거나 지웁니다. 설명은 이 작업이 무엇을 위한 것인지 남기는 메모로, Project 탭과 `project list --format json`, MCP `project_info`에 나옵니다.
+
+```bash
+gori run project describe api-test "staging sweep, read-only creds"
+gori run project describe api-test --clear
+```
 
 #### project switch {#project-switch}
 
@@ -1753,6 +1773,7 @@ gori run project env                              # KEY=[REDACTED] 목록 (--sho
 gori run project env --format json
 gori run project env set TOKEN=secret
 gori run project env set HOST api.example.com
+printf %s "$TOKEN" | gori run project env set TOKEN --value-stdin
 gori run project env delete TOKEN
 ```
 
@@ -1760,6 +1781,7 @@ gori run project env delete TOKEN
 |---------------------|-------------|
 | (default) | 프로젝트 변수 목록; `--format`은 `text` 또는 `json` |
 | `set KEY=value` · `set KEY value` | 프로젝트 변수 upsert (KEY는 `[A-Za-z_][A-Za-z0-9_]*`) |
+| `set KEY --value-stdin` | 값을 stdin(파이프나 리다이렉트, 터미널은 거부)에서 읽어 토큰이 프로세스 목록과 셸 히스토리에 남지 않게 합니다. 끝의 줄바꿈 하나는 버립니다 |
 | `delete KEY` (`rm`) | 프로젝트 변수 제거 |
 
 #### project host-override {#project-host-override}
