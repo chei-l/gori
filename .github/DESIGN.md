@@ -5121,3 +5121,46 @@ the Sandbox off passes an exclude once Layer 1 is waived (`send_block`, as on th
 remedy names the waiver beside the exclude (`Outbound.remedy(waiver_passes_exclude:)`, asked of
 `Outbound#send_passes_exclude?`). The caller says whether it is a send; `check` cannot, because
 one verdict serves both kinds of caller. Gating is unchanged, only what the refusal says.
+
+### 2026-10-21: a draft's unresolved `$ENV.X` is refused, and an untouched flow seed is evidence (#1666, #1670)
+
+Refines P7's provenance axis and the #571 rule that a token with no value is literal text.
+
+- Under the namespaced grammar an `$ENV.X` is a reference by construction, the class `$GEN`
+  already is (#1591). So AUTHORED request text naming one that resolves to nothing is refused
+  before it dials (`Env.unresolved_env`), as `PlanError::Reason::UnresolvedEnv`, the reason a
+  `$GEN` that cannot mint uses: no new member, so the surfaces word it with the sentence they
+  have. It is asked before the env pass, because that pass consumes the `$$ENV.X` escape. A bare
+  `$name`, a verbatim send and a slot header stay literal, as before.
+- Where: the Repeater, Fuzzer, Miner and Sequencer plans for a draft; the TUI Repeater's `^R`
+  and `%%%` send group (`RepeaterView#env_refusal`); `gori run send` and MCP `send_request{url}`
+  (URL path and query, headers, body, a raw request: `UrlRequest.expand`); and the operator's
+  own `-H`/`-d`/`--path`/`-X` on `gori run repeater <flow-id>` and on an evidence session's
+  `repeater send`.
+- Not covered yet by the refusal: Discover custom headers (`Headers.from_flow` may have copied
+  them off a capture, with nothing to say so), WebSocket frames, the three minimize paths (a
+  draft's unresolved `$ENV.X` is minimized as text), and an operator-typed `$ENV.X` inside a TUI
+  evidence tab, which the tab's per-name provenance cannot tell from a captured one and so sends
+  literally.
+- A Repeater session is evidence while its bytes still equal what its flow seed produces
+  (`Repeater::DraftMarkers.evidence?`: `FlowRequest.build` in either request-line form, so a
+  `keep_request_line` seed counts). Every headless replay of a session asks it: `repeater
+  send`/`race`/`timing`/`ws`/`minimize`, `fuzz --repeater`, MCP `send_request`/`send_websocket`/
+  `race_requests`/`timing_requests`/`minimize_repeater`/`fuzz_start`, retest steps, request
+  macros and refresh steps. It is asked of the STORED row, and an edited row is a draft.
+- A send that adds its own bytes to an evidence session (`repeater send -H`/`-b`/`--path`, a flow
+  replay's `-H`/`-d`/`--path`) keeps it evidence per NAME, the TUI's rule
+  (`RepeaterView#evidence_send_literals`, `Env.literal_keys` of the captured bytes): the
+  operator's `$ENV` expands at the merge, the capture's `$BIND`/`$GEN` names stay literal at the
+  send seam, and any other name resolves there. A name the operator types that the capture also
+  carries stays literal; gori cannot tell the two apart, and evidence wins. An accepted cost of
+  the same rule: the send seam's pass consumes no escape in evidence it does not resolve, so an
+  operator `-H 'Z: $$GEN.UUID'` on an evidence send goes out as `$$GEN.UUID`, not `$GEN.UUID`.
+- A race or timing group rides one Sender, so it has one provenance: a group that mixes untouched
+  seeds and drafts is refused, CLI and MCP, as the TUI race refuses a group whose `evidence?`
+  differs. `--verbatim` waives it, since nothing expands for any member.
+- A session whose seed flow was deleted is a draft headlessly (nothing is left to compare) but
+  stays evidence in the TUI, which keys on `flow_id`. Left as is: the headless reading is the
+  conservative one. The same split follows `minimize --apply` (CLI `--apply`, MCP `apply`): it
+  rewrites the seed's row, so headless it is a draft from then on, while the TUI tab, keyed on
+  `flow_id`, keeps treating it as evidence.

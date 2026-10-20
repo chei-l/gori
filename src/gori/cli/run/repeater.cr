@@ -1120,8 +1120,13 @@ module Gori
                                             tls_preset : String? = nil,
                                             request : Bytes = rec.request,
                                             pinned_cl : Bool = false,
-                                            sse : Repeater::StreamBound? = nil) : Repeater::PlanOptions
+                                            sse : Repeater::StreamBound? = nil,
+                                            evidence : Bool = false,
+                                            evidence_literals : Set(String)? = nil) : Repeater::PlanOptions
         Repeater::PlanOptions.new([request],
+          # `Repeater::DraftMarkers.evidence?`: an unedited flow seed is a capture, not a draft.
+          # `evidence_literals` narrows that to the capture's own names, for a send that adds its own.
+          evidence: evidence, evidence_literals: evidence_literals,
           reframe_grpc: reframe_grpc,
           default_target: rec.target, http2: rec.http2?, sni: rec.sni,
           timeout: timeout, sse: sse,
@@ -1272,6 +1277,7 @@ module Gori
         # guard is asked HERE, with the store open (`DraftMarkers.live?` may read the seed flow),
         # exactly as `repeater send` asks it — the race renders no markers, so a live one would
         # put the literal § bytes on the wire; `--verbatim` waives it, matching `repeater send`.
+        seeds = Set(Int64).new # the members still holding their flow seed's bytes (#1670)
         loaded, host_overrides = begin
           rows = ids.map do |id|
             rec = store.get_repeater_full(id)
@@ -1279,6 +1285,7 @@ module Gori
             if !verbatim && Repeater::DraftMarkers.live?(store, rec)
               abort "gori run repeater race: #{Repeater::DraftMarkers.refusal(id, MARKER_REMEDY)}"
             end
+            seeds << id if Repeater::DraftMarkers.evidence?(store, rec)
             {id, rec}
           end
           {rows, Gori::HostOverrides.load(store)}
@@ -1299,7 +1306,7 @@ module Gori
         activate_slot(slot, "gori run repeater race")
         outbound = project_outbound(project, allow_unscoped)
         plan, labels = build_cli_race_plan(loaded, mode, outbound, insecure, host_overrides,
-          verbatim, timeout, reframe_grpc, tls_preset)
+          verbatim, timeout, reframe_grpc, tls_preset, seeds)
 
         abort_if_out_of_scope!(outbound, plan, "gori run repeater race")
         abort_if_blocked!(plan, "gori run repeater race")
@@ -1360,14 +1367,14 @@ module Gori
         warmup = warmup.clamp(0, count - 1)
 
         project = resolve_read_project(proj.name, proj.db)
-        loaded, host_overrides, mode = load_timing_members(project, ids, verbatim, force_http2)
+        loaded, host_overrides, mode, seeds = load_timing_members(project, ids, verbatim, force_http2)
 
         activate_slot(slot, "gori run repeater timing")
         outbound = project_outbound(project, allow_unscoped)
         # Reuse the race's origin/transport unification — a differential pair rides one connection
         # shape too, so a mismatch is refused before any send.
         plan, labels = build_cli_race_plan(loaded, mode, outbound, insecure, host_overrides,
-          verbatim, timeout, reframe_grpc, tls_preset, cmd_label: "gori run repeater timing")
+          verbatim, timeout, reframe_grpc, tls_preset, seeds, cmd_label: "gori run repeater timing")
 
         abort_if_out_of_scope!(outbound, plan, "gori run repeater timing")
         abort_if_blocked!(plan, "gori run repeater timing")
@@ -1403,8 +1410,9 @@ module Gori
       # store, on a missing session or a mixed-transport pair. Extracted from `cmd_repeater_timing`
       # so its body stays under the complexity gate.
       private def self.load_timing_members(project, ids : Array(Int64), verbatim : Bool,
-                                           force_http2 : Bool?) : {Array({Int64, Store::RepeaterRecord}), Gori::HostOverrides?, Bool}
+                                           force_http2 : Bool?) : {Array({Int64, Store::RepeaterRecord}), Gori::HostOverrides?, Bool, Set(Int64)}
         store = open_store(project, read_only: true)
+        seeds = Set(Int64).new # see `cmd_repeater_race`
         loaded, host_overrides = begin
           rows = ids.map do |id|
             rec = store.get_repeater_full(id)
@@ -1412,6 +1420,7 @@ module Gori
             if !verbatim && Repeater::DraftMarkers.live?(store, rec)
               abort "gori run repeater timing: #{Repeater::DraftMarkers.refusal(id, MARKER_REMEDY)}"
             end
+            seeds << id if Repeater::DraftMarkers.evidence?(store, rec)
             {id, rec}
           end
           {rows, Gori::HostOverrides.load(store)}
@@ -1425,7 +1434,7 @@ module Gori
           abort "gori run repeater timing: the sessions mix HTTP/1.1 and HTTP/2 — pass --http1 or --http2 to force one" if modes.size > 1
           mode = modes.first
         end
-        {loaded, host_overrides, mode}
+        {loaded, host_overrides, mode, seeds}
       end
 
       # The validated race member ids: at least two integers, within `--max-requests` and the
@@ -1450,11 +1459,20 @@ module Gori
       # validates its target / env), assert one origin across the group, and build ONE plan over
       # every member's request from the first session's send context. Aborts (closing `outbound`)
       # on a per-member builder refusal or a cross-origin group.
+      # `cmd_label`'s refusal for a race or timing group mixing untouched seeds (`seeds`) and drafts,
+      # or nil: one plan, one provenance (#1670, `DraftMarkers.mixed_group_refusal`).
+      def self.race_provenance_refusal(loaded : Array({Int64, Store::RepeaterRecord}), seeds : Set(Int64),
+                                       verbatim : Bool, cmd_label : String) : String?
+        captured = loaded.map { |(id, _)| seeds.includes?(id) }
+        what = cmd_label.ends_with?("timing") ? "a timing run" : "a race"
+        Repeater::DraftMarkers.mixed_group_refusal(captured, verbatim, what).try { |why| "#{cmd_label}: #{why}" }
+      end
+
       private def self.build_cli_race_plan(loaded : Array({Int64, Store::RepeaterRecord}), mode : Bool,
                                            outbound : Gori::Outbound, insecure : Bool,
                                            host_overrides : Gori::HostOverrides?, verbatim : Bool,
                                            timeout : Time::Span?, reframe_grpc : Bool,
-                                           tls_preset : String?,
+                                           tls_preset : String?, seeds : Set(Int64),
                                            cmd_label : String = "gori run repeater race") : {Repeater::Plan, Array(String)}
         # The dial SIGNATURE every member must share: the group rides ONE Sender built from the
         # anchor, so a member whose origin, effective Content-Length policy, SNI or TLS preset
@@ -1467,7 +1485,7 @@ module Gori
         loaded.each do |(id, rec)|
           probe = begin
             Repeater::Plan.build(session_plan_options(rec, insecure, host_overrides, verbatim, timeout,
-              reframe_grpc, tls_preset), outbound)
+              reframe_grpc, tls_preset, evidence: seeds.includes?(id)), outbound)
           rescue ex : Repeater::PlanError
             outbound.close
             repeater_plan_abort(cmd_label, ex, "session ##{id}")
@@ -1485,9 +1503,14 @@ module Gori
                 "#{sigs.map { |(s, h, po, _, _, _)| "#{s}://#{h}:#{po}" }.uniq!.join(", ")})"
         end
 
+        if why = race_provenance_refusal(loaded, seeds, verbatim, cmd_label)
+          outbound.close
+          abort why
+        end
         anchor = loaded.first[1]
         plan = begin
           Repeater::Plan.build(Repeater::PlanOptions.new(wires,
+            evidence: loaded.all? { |(id, _)| seeds.includes?(id) },
             reframe_grpc: reframe_grpc, default_target: anchor.target, http2: mode, sni: anchor.sni,
             timeout: timeout, expand_request: !verbatim, expand_bindings: !verbatim,
             preserve_field_case: verbatim, auto_content_length: !verbatim && anchor.auto_content_length?,
@@ -1684,16 +1707,16 @@ module Gori
         # carries — the `--path` copy when there is one (it edits a COPY for this send; the row
         # keeps its own, see `FlowRequest.replace_request_target`) — so a `§id§` in the stored
         # target that `--path` replaced does not refuse a send that no longer carries it.
-        pinned_cl = false
-        rec, host_overrides, markers_live, request = begin
+        rec, host_overrides, markers_live, request, seed_evidence = begin
           r = store.get_repeater_full(id)
-          req = r.try { |row| (p = path_override) ? Repeater::FlowRequest.replace_request_target(row.request, p) : row.request }
-          if bytes = req
-            built = per_send_request(bytes, headers, grpc_fields)
-            abort "gori run repeater send: --grpc-field #{built}" if built.is_a?(String)
-            req, pinned_cl = built
+          sent = begin
+            r ? session_send_request(store, r, path_override, headers, grpc_fields, verbatim) : {nil, false, false}
+          rescue ex : Repeater::PlanError
+            repeater_plan_abort("gori run repeater send", ex, "session ##{id}")
           end
-          {r, Gori::HostOverrides.load(store), r && req ? Repeater::DraftMarkers.live?(store, r, req) : false, req}
+          abort "gori run repeater send: --grpc-field #{sent}" if sent.is_a?(String)
+          req, pinned_cl, evidence = sent
+          {r, Gori::HostOverrides.load(store), r && req ? Repeater::DraftMarkers.live?(store, r, req) : false, req, evidence}
         ensure
           store.close
         end
@@ -1713,7 +1736,8 @@ module Gori
 
         plan = begin
           Repeater::Plan.build(session_plan_options(rec, insecure, host_overrides, verbatim, timeout, reframe_grpc,
-            tls_preset, request: request, pinned_cl: pinned_cl, sse: sse.bound(Repeater::StreamBound::SEND)), outbound)
+            tls_preset, request: request, pinned_cl: pinned_cl, sse: sse.bound(Repeater::StreamBound::SEND),
+            evidence: seed_evidence, evidence_literals: seed_send_literals(rec, seed_evidence)), outbound)
         rescue ex : Repeater::PlanError
           repeater_plan_abort("gori run repeater send", ex, "session ##{id}")
         end
@@ -2052,13 +2076,13 @@ module Gori
                                        cancel : Proc(Bool)? = nil) : {Bool, String?}
         loaded = load_ws_session_repeater(id, project)
         return {false, loaded} if loaded.is_a?(String)
-        rec, host_overrides = loaded
+        rec, host_overrides, evidence = loaded
 
         activate_slot(slot, "gori run repeater ws")
         outbound = project_outbound(project, allow_unscoped)
         begin
           plan = build_ws_session_plan(id, rec, host_overrides, outbound,
-            insecure: insecure, verbatim: verbatim, tls_preset: tls_preset)
+            insecure: insecure, verbatim: verbatim, tls_preset: tls_preset, evidence: evidence)
           return {false, plan} if plan.is_a?(String)
 
           opened = plan.open_ws(ws_keep_key || rec.ws_keep_key?, auto_replies, cancel,
@@ -2088,10 +2112,11 @@ module Gori
       end
 
       private def self.load_ws_session_repeater(id : Int64,
-                                                project : Project) : {Store::RepeaterRecord, Gori::HostOverrides} | String
+                                                project : Project) : {Store::RepeaterRecord, Gori::HostOverrides, Bool} | String
         store = open_store(project, read_only: true)
-        rec, host_overrides = begin
-          {store.get_repeater_full(id), Gori::HostOverrides.load(store)}
+        rec, host_overrides, evidence = begin
+          r = store.get_repeater_full(id)
+          {r, Gori::HostOverrides.load(store), r ? Repeater::DraftMarkers.evidence?(store, r) : false}
         ensure
           store.close
         end
@@ -2107,17 +2132,17 @@ module Gori
         if reason = Repeater::WsSession.refusal(rec.request)
           return "gori run repeater ws: #{reason}"
         end
-        {rec, host_overrides}
+        {rec, host_overrides, evidence}
       end
 
       private def self.build_ws_session_plan(id : Int64, rec : Store::RepeaterRecord,
                                              host_overrides : Gori::HostOverrides,
                                              outbound : Gori::Outbound, *,
                                              insecure : Bool, verbatim : Bool,
-                                             tls_preset : String?) : Repeater::Plan | String
+                                             tls_preset : String?, evidence : Bool = false) : Repeater::Plan | String
         plan = begin
           Repeater::Plan.build(session_plan_options(rec, insecure, host_overrides, verbatim, nil, false,
-            tls_preset), outbound)
+            tls_preset, evidence: evidence), outbound)
         rescue ex : Repeater::PlanError
           return repeater_plan_error("gori run repeater ws", ex, "session ##{id}")
         end
@@ -2715,7 +2740,8 @@ module Gori
       # UNRESOLVED token in an override is refused before this runs
       # (`refuse_unresolved_overrides`), so nothing reaches `Env.expand` that it would leave
       # literal — except a DECLARED session binding, which `Env.expand` deliberately leaves
-      # for `Env.expand_bindings` at the send seam.
+      # for `Env.expand_bindings` at the send seam. An `$ENV.X` with no value is refused by the
+      # expansion itself (`UrlRequest.expand`, #1666), raised as the plan's `PlanError`.
       #
       # Returns the wire plus whether an explicit CL was pinned. `explicit_cl` is exactly the
       # session store's `auto_content_length` toggle inverted, so both ways of pinning a CL
@@ -2776,7 +2802,7 @@ module Gori
           # a tchar, so a token there could only ever be a typo, and folding it into the
           # dedup key would make `-H '$H: a' -H 'X: b'` collide once `$H` resolved to `X`).
           # `expand: false` is `--verbatim`: the operator's value goes out as typed.
-          (custom_headers[lname] ||= [] of String) << (expand ? Env.expand(val) : val)
+          (custom_headers[lname] ||= [] of String) << (expand ? Repeater::UrlRequest.expand(val) : val)
         end
         # --rm-header: drop every line with this name. Distinct from `-H "X:"`, which sends
         # X with an EMPTY value — both are real tests and neither can express the other.
@@ -2818,7 +2844,7 @@ module Gori
         # it — which is why `Repeater::Plan`'s post-expansion resync is now a no-op on this
         # path rather than the thing that quietly re-lengthed the CAPTURED body.
         final_body = if b_over = body_override
-                       (expand ? Env.expand(b_over) : b_over).to_slice
+                       (expand ? Repeater::UrlRequest.expand(b_over) : b_over).to_slice
                      else
                        body_bytes
                      end
@@ -2991,13 +3017,13 @@ module Gori
       # Called with the store open: it published the `.proto` schema the field names resolve by.
       # The same `Protobuf::Edit.set` the TUI's add-field prompt and MCP `grpc_fields` call.
       def self.per_send_request(request : Bytes, headers : Array(String),
-                                grpc_fields : Array(String)) : {Bytes, Bool} | String
+                                grpc_fields : Array(String), expand : Bool = false) : {Bytes, Bool} | String
         unless grpc_fields.empty?
           edited = Repeater::GrpcFields.apply(request, grpc_fields)
           return edited if edited.is_a?(String)
           request = edited
         end
-        session_header_overrides(request, headers)
+        session_header_overrides(request, headers, expand)
       end
 
       GRPC_FIELD_HELP = "gRPC: set or ADD a field on the unary request message for this send, or remove one with -PATH (repeatable, applied in order; " \
@@ -3012,10 +3038,51 @@ module Gori
         edited
       end
 
-      private def self.session_header_overrides(request : Bytes, headers : Array(String)) : {Bytes, Bool}
+      # The bytes `repeater send` carries for session `row`, whether a `-H` pinned their CL, and
+      # whether the row is evidence (#1670) — or the `--grpc-field` refusal. Raises `PlanError`
+      # for an operator value naming an `$ENV` var with no value.
+      #
+      # Evidence is asked of the STORED row: an unedited flow seed replays its captured tokens
+      # literally, as the tab does, and this send's own `--path`/`-H`/`-b` are then the only
+      # operator bytes in it, so their `$ENV` expands here, as on a flow replay.
+      def self.session_send_request(store : Store, row : Store::RepeaterRecord, path_override : String?,
+                                    headers : Array(String), grpc_fields : Array(String),
+                                    verbatim : Bool) : {Bytes?, Bool, Bool} | String
+        evidence = Repeater::DraftMarkers.evidence?(store, row)
+        own = evidence && !verbatim
+        req = if p = path_override
+                Repeater::FlowRequest.replace_request_target(row.request, own ? Repeater::UrlRequest.expand(p) : p)
+              else
+                row.request
+              end
+        return {nil, false, evidence} unless req
+        built = per_send_request(req, headers, grpc_fields, expand: own)
+        return built if built.is_a?(String)
+        {built[0], built[1], evidence}
+      end
+
+      # The names an evidence session's send keeps literal at the send seam: the capture's own,
+      # the TUI's per-name rule (`RepeaterView#evidence_send_literals`), so a `$BIND`/`$GEN` this
+      # send's `-H`/`-b`/`--path` added resolves like any draft's. nil for a draft.
+      def self.seed_send_literals(rec : Store::RepeaterRecord, evidence : Bool) : Set(String)?
+        evidence ? Env.literal_keys(String.new(rec.request)) : nil
+      end
+
+      # `expand`: the session is evidence, so the plan will not expand it and the operator's own
+      # `-H` values expand here (`build_single_flow_request`). A draft leaves them to the plan.
+      private def self.session_header_overrides(request : Bytes, headers : Array(String),
+                                                expand : Bool = false) : {Bytes, Bool}
         return {request, false} if headers.empty?
         boundary = Env.head_body_boundary(request)
-        build_single_flow_request(request[0, boundary], request[boundary..], headers, nil, nil, expand: false)
+        build_single_flow_request(request[0, boundary], request[boundary..], headers, nil, nil, expand: expand)
+      end
+
+      # `UrlRequest.expand` over one operator-typed per-send value, aborting with the plan's
+      # sentence when it names an `$ENV.X` with no value (#1666).
+      private def self.expand_override(text : String, prefix : String) : String
+        Repeater::UrlRequest.expand(text)
+      rescue ex : Repeater::PlanError
+        repeater_plan_abort(prefix, ex)
       end
 
       # nil when `-X METHOD` is a method the request line can carry; the refusal otherwise. The
@@ -3238,20 +3305,24 @@ module Gori
         # and sent a different request. So the check moves here, onto the drafts alone.
         refuse_unresolved_overrides(target_override, sni_override)
 
-        wire, explicit_cl = build_single_flow_request(head_bytes, body_bytes, headers, body_override,
-          target_override, removed_headers, expand: !verbatim)
+        wire, explicit_cl = begin
+          build_single_flow_request(head_bytes, body_bytes, headers, body_override,
+            target_override, removed_headers, expand: !verbatim)
+        rescue ex : Repeater::PlanError
+          repeater_plan_abort("gori run repeater", ex, "flow ##{id}")
+        end
         # `--path` and `-X` last, over the merged wire: no other override touches the request
         # line, and the values are the operator's, so they expand like `-H`/`-d` do (the capture
         # around them does not — see `build_single_flow_request`).
         if p = path_override
-          wire = Repeater::FlowRequest.replace_request_target(wire, verbatim ? p : Env.expand(p)) ||
+          wire = Repeater::FlowRequest.replace_request_target(wire, verbatim ? p : expand_override(p, "gori run repeater")) ||
                  abort("gori run repeater: flow ##{id}'s request has no request line target to replace " \
                        "(#{request_line_preview(wire)})")
         end
         if m = method_override
           # Checked again AFTER expansion: `-X '$ENV.M'` passes the argv check above, and it is
           # the expanded value that is spliced into the request line.
-          m = Env.expand(m) unless verbatim
+          m = expand_override(m, "gori run repeater") unless verbatim
           if err = replay_method_error(m)
             abort "gori run repeater: #{err}"
           end
@@ -3273,6 +3344,9 @@ module Gori
             # operator's OWN `-H`/`-b`/`--target` above, so nothing downstream needs to (and
             # nothing downstream can still tell the operator's bytes from the capture's).
             evidence: true,
+            # …and at the send seam, per NAME (`seed_send_literals`): the capture's own `$BIND`/`$GEN`
+            # stay literal while one an operator `-H` added resolves. `--verbatim` resolves none.
+            evidence_literals: verbatim ? nil : Env.literal_keys(String.new(raw_bytes)),
             # `--verbatim`: the h2 encoder keeps the field-name case the operator typed.
             preserve_field_case: verbatim,
             verify: !insecure, timeout: timeout, overrides: host_overrides,

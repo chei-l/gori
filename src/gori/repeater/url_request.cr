@@ -1,7 +1,9 @@
 require "base64"
 require "uri"
 require "../env"
+require "../fuzz/content_length"
 require "../proxy/codec/http1"
+require "./plan"
 
 module Gori::Repeater
   # A hand-authored request that starts from a URL rather than from a capture or a saved session:
@@ -16,19 +18,23 @@ module Gori::Repeater
   # send that frames the request itself — so the typed half moved down here (DESIGN.md §2: option
   # PARSING is per-surface, everything after the normalized options exists once). MCP keeps what
   # is genuinely its own: reading `url`/`headers`/`body` out of JSON, and the `*_base64` forms.
-  # Every refusal raises `Gori::Error`, which both surfaces already turn into their own sentence.
+  # Every refusal raises `Gori::Error`, which both surfaces already turn into their own sentence,
+  # except an unresolved `$ENV.KEY`: that is the plan's `PlanError`, so it reads as it does on a
+  # session send.
   module UrlRequest
     record Built, bytes : Bytes, scheme : String, host : String, port : Int32
 
     # The dialed origin of a URL, every check already run, plus the parsed URI the structured
-    # shape reads the path and query from.
-    record Target, uri : URI, scheme : String, host : String, port : Int32
+    # shape reads the path and query from, and the URL as authored (before `Env.expand`), which
+    # that shape checks for an unresolved `$ENV.KEY` (#1666).
+    record Target, uri : URI, scheme : String, host : String, port : Int32, authored : String
 
     # Resolve `url` (after `Env.expand`) to the origin a send would dial, with every check —
     # a missing/malformed host, a non-http scheme, a CR/LF in the authority, an out-of-range
     # port. Kept apart from the builders so a FIELD-NATIVE h2 send (whose fields are the whole
     # message) can resolve the same origin without building request bytes it will never send.
     def self.target(url : String) : Target
+      authored = url
       url = Env.expand(url)
       # URI.parse raises URI::Error on a malformed authority (e.g. a non-numeric port
       # "example.com:abc"); turn that into a clean Gori::Error so the caller gets an actionable
@@ -65,7 +71,7 @@ module Gori::Repeater
       # ":99999" would otherwise reach the dialer as a doomed connect. A valid TCP port is
       # 1..65535.
       raise Gori::Error.new("invalid port #{port} in url (expected 1..65535)") unless 1 <= port <= 65535
-      Target.new(uri, scheme, host, port)
+      Target.new(uri, scheme, host, port, authored)
     end
 
     # Exact caller-supplied octets as the request (MCP's `raw_base64`): nothing to normalise
@@ -78,27 +84,41 @@ module Gori::Repeater
     # expansion and no bare-LF promotion. Without it the head's lone LFs become CRLF so a
     # hand-typed request still frames (`normalize_raw`), and `$ENV.KEY` tokens expand. A bare-LF
     # header terminator is a standard front-end/back-end desync primitive, which is why the flag
-    # exists; an unresolved `$VAR` is not refused anywhere (see `Env::Escape`) — the literal `$`
-    # is the SSTI/shell payload the flag exists to deliver.
+    # exists. A bare `$VAR` with no value stays literal (see `Env::Escape`), the SSTI/shell
+    # payload the flag exists to deliver; an unresolved `$ENV.KEY` is refused (`expand`).
+    #
+    # An expansion that changed the body's length re-frames Content-Length (#1668), as the plan
+    # does for a session (`resync_cl_after_expansion`) and the send seam does for `$GEN`. A
+    # token-free body keeps a hand-set CL as written.
     def self.raw(target : Target, raw : String, verbatim : Bool) : Built
-      bytes = verbatim ? raw.to_slice : normalize_raw(Env.expand(raw))
+      bytes = verbatim ? raw.to_slice : Fuzz::ContentLength.resync_expanded(raw.to_slice, normalize_raw(expand(raw)))
       Built.new(bytes, target.scheme, target.host, target.port)
+    end
+
+    # `Env.expand` for one AUTHORED part of a request, refusing an `$ENV.KEY` that resolves to
+    # nothing (`Plan.refuse_unresolved_env`, #1666). Public for the surfaces that expand a body
+    # before handing it to `structured`.
+    def self.expand(text : String) : String
+      Plan.refuse_unresolved_env(text)
+      Env.expand(text)
     end
 
     # The structured shape: `method` (default GET), the URL's path and query as the request
     # target, `headers` in the caller's order (each VALUE expanded unless `expand` is off), and
-    # `body` as FINAL bytes — expanding it, or not, is the caller's call, because a byte-exact
-    # body (MCP's `body_base64`, `gori run send --body-file`) must not have its length changed
-    # under it. `expand: false` is `gori run send --verbatim`: a `$ENV.KEY` the operator typed in
-    # a header value is the payload, and MCP's `send_request{verbatim:true}` passes it the same way.
+    # `body` as FINAL bytes, or as authored TEXT that expands with the headers (`gori run send -d`,
+    # MCP's `body`). Bytes are never expanded: a byte-exact body (MCP's `body_base64`, `gori run
+    # send --body-file`) must not have its length changed under it. `expand: false` is `gori run
+    # send --verbatim`: a `$ENV.KEY` the operator typed in a header value is the payload, and
+    # MCP's `send_request{verbatim:true}` passes it the same way.
     def self.structured(target : Target, method : String?, headers : Array({String, String}),
-                        body : Bytes?, *, expand : Bool = true) : Built
+                        body : (Bytes | String)?, *, expand : Bool = true) : Built
       # Upper-cased unless `expand: false`: an agent's `"post"` means POST, while `--verbatim` /
       # `verbatim:true` sends `get` as typed — methods are case-sensitive tokens, and a lowercase
       # verb slipping past a case-sensitive ACL is a probe.
       m = expand ? (method || "GET").upcase : method || "GET"
       check_method(m)
       request_target = request_target_of(target)
+      body = authored_body(target, headers, body, expand)
 
       lines = [] of {String, String}
       headers.each do |(k, v)|
@@ -140,6 +160,22 @@ module Gori::Repeater
     def self.basic_auth(uri : URI) : String?
       user = uri.user || return nil
       "Basic #{Base64.strict_encode("#{user}:#{uri.password}")}"
+    end
+
+    # ONE refusal over every authored part of a structured request (#1666), so it names every
+    # unresolved `$ENV.KEY` rather than the first part's; then the body as final bytes. The URL's
+    # path and query become the request line, so they are request text too: checked here and not
+    # in `target`, which a field-native send also resolves its origin through without sending
+    # that path.
+    private def self.authored_body(target : Target, headers : Array({String, String}),
+                                   body : (Bytes | String)?, expand : Bool) : Bytes?
+      if expand
+        authored = [target.authored] + headers.map(&.[1])
+        authored << body if body.is_a?(String)
+        Plan.refuse_unresolved_env(authored.join('\n'))
+      end
+      return body unless body.is_a?(String)
+      (expand ? Env.expand(body) : body).to_slice
     end
 
     # The URL's path and query as the request-target, refused when it holds a byte that would

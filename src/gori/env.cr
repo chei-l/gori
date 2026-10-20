@@ -368,6 +368,34 @@ module Gori
       nil
     end
 
+    # The `$ENV` tokens in AUTHORED request text that the env-var pass would leave unresolved,
+    # spelled and comma-joined for a refusal's detail, or nil (#1666). Namespaced only: there an
+    # `$ENV.X` is a reference by construction, the class `unmintable` refuses for `$GEN`, while a
+    # bare `$name` is GraphQL or Mongo text and stays literal (#571). Asked of the text BEFORE that
+    # pass, since an `$$ENV.X` escape the pass consumes reads as a token afterwards. Never asked of
+    # evidence: a capture's `$ENV.X` is bytes the client sent.
+    def self.unresolved_env(text : String) : String?
+      prefix = Settings.env_prefix
+      return nil unless Settings.env_syntax.namespaced? && !prefix.empty?
+      return nil unless text.byte_index("#{prefix}#{Namespace::Env.label}.")
+      names = scan_unresolved(text.to_slice, effective_vars, prefix, nil, owns: Owns::Env)
+      names.empty? ? nil : token_list(names)
+    end
+
+    # The sentence for a refused `$ENV.TOTP_SECRET` in `detail` (as `mint_refusal` reads it), or
+    # nil. That var is never a token (#1591), so "set it" is the wrong remedy: it may well be set,
+    # and `project env set` has just said only `$GEN.TOTP` reads it (#1707). Any OTHER token in
+    # `detail` is yielded, still spelled as listed, for the surface's own sentence to follow it.
+    def self.totp_secret_refusal(detail : String?, & : String -> String) : String?
+      tokens = (detail || "").split(',').map(&.strip).reject(&.empty?)
+      totp = ->(t : String) { (r = parse_ref?(t)) ? r.ns.env? && r.name == TOTP_SECRET_VAR : false }
+      return nil unless tokens.any?(&totp)
+      note = "#{spell(TOTP_SECRET_VAR, Namespace::Env)} never expands — #{TOTP_SECRET_VAR} is read only by " \
+             "#{spell("TOTP", Namespace::Gen)}; use that token, or remove this one"
+      rest = tokens.reject(&totp)
+      rest.empty? ? note : "#{note}; #{yield rest.join(", ")}"
+    end
+
     # Why a token in `detail` (a refused build's comma-joined token list) cannot mint, as a
     # sentence, or nil when none is a generator that cannot.
     def self.mint_refusal(detail : String?) : String?
@@ -872,7 +900,11 @@ module Gori
     # `bare_spelled` marks the second cause, and it is the worse one: a `$SESSION` under a
     # NAMESPACED install is not an unbound reference at all, it is text. Binding it changes
     # nothing, ever — `$BIND.SESSION` is the only spelling that resolves.
-    record SlotLiteral, name : String, bare_spelled : Bool do
+    #
+    # `env` marks a third: an `$ENV.X`, which no pass over a slot header ever resolves (a slot
+    # resolves BIND and GEN only, `expand_bindings_as`), so its `name` is the QUALIFIED one and the
+    # only remedy is the value itself (`slot_env_note`, #1689).
+    record SlotLiteral, name : String, bare_spelled : Bool, env : Bool = false do
       # What the operator should write instead. For a bare spelling that is the RE-SPELLING; for a
       # genuinely unbound reference it is the escape, since the value is what they wanted.
       def remedy : String
@@ -934,13 +966,18 @@ module Gori
                                            syntax : Syntax, vals : Hash(String, String),
                                            declared : Array(String)) : Nil
       # BARE names in the BIND namespace: they are matched against `vals` and `declared`, both
-      # keyed by bare name, and an `$ENV.X` in a slot header is the env layer's business.
+      # keyed by bare name. An `$ENV.X` is reported after them, whatever is set: no env pass
+      # ever reads a slot header (#1689).
       token_names(value, prefix, Namespace::Bind).each do |name|
         next if vals.has_key?(name)
         next unless declared.includes?(name) || slot.claims?(name)
         literal << SlotLiteral.new(name, false) if seen.add?(name)
       end
       return if syntax.bare?
+      token_names(value, prefix, Namespace::Env).each do |name|
+        key = qualify(Namespace::Env, name)
+        literal << SlotLiteral.new(key, false, env: true) if seen.add?(key)
+      end
       each_token(value.to_slice, prefix, Syntax::Bare) do |found|
         name = found.name
         next unless declared.includes?(name) || slot.claims?(name)
@@ -970,38 +1007,56 @@ module Gori
           fresh << lit
         end
       end
-      unless fresh.empty?
-        # gori.log (#411). Once per (slot, name) until a surface drains the list: this runs
-        # per SEND, and a Fuzzer sweep under a slot would otherwise write one line per request.
-        ::Log.warn do
-          names = fresh.map(&.name)
-          # A BARE spelling under the namespaced grammar is a different sentence, because binding
-          # is not the remedy for it: the reader never looks at those bytes.
-          stale = fresh.select(&.bare_spelled)
-          String.build do |io|
-            io << "session slot #{slot.name.inspect} sends "
-            io << "#{token_list(names, ns: Namespace::Bind)} LITERALLY — "
-            if stale.size == fresh.size
-              io << "#{stale.size == 1 ? "it is" : "they are"} spelled the BARE way and this "
-              io << "install reads #{spell("KEY", Namespace::Env)}/#{spell("NAME", Namespace::Bind)}, "
-              io << "so no binding will ever resolve #{stale.size == 1 ? "it" : "them"}. Write "
-              io << "`#{stale[0].remedy}`"
-            else
-              io << "nothing has bound #{fresh.size == 1 ? "it" : "them"} in this process (a "
-              io << "binding value is memory-only and every run starts with an empty table). "
-              io << "Bind first (`--bind-from`, a Repeater send under this slot), or write "
-              io << "`#{fresh[0].remedy}`"
-              unless stale.empty?
-                io << " — and `#{spell(stale[0].name, Namespace::Bind)}` for "
-                io << "#{token_list(stale.map(&.name), ns: Namespace::Bind)}, which "
-                io << "#{stale.size == 1 ? "is" : "are"} spelled the bare way this install no "
-                io << "longer reads"
-              end
-            end
+      # gori.log (#411). Once per (slot, name) until a surface drains the list: this runs
+      # per SEND, and a Fuzzer sweep under a slot would otherwise write one line per request.
+      envs, fresh = fresh.partition(&.env)
+      ::Log.warn { "session slot #{slot.name.inspect}: #{slot_env_note(envs.map(&.name))}" } unless envs.empty?
+      ::Log.warn { unbound_overlay_warning(slot.name, fresh) } unless fresh.empty?
+      found.map(&.name)
+    end
+
+    # The log line for slot binding names that went out literally (`report_unbound_overlay`).
+    private def self.unbound_overlay_warning(slot_name : String, fresh : Array(SlotLiteral)) : String
+      names = fresh.map(&.name)
+      # A BARE spelling under the namespaced grammar is a different sentence, because binding
+      # is not the remedy for it: the reader never looks at those bytes.
+      stale = fresh.select(&.bare_spelled)
+      String.build do |io|
+        io << "session slot #{slot_name.inspect} sends "
+        io << "#{token_list(names, ns: Namespace::Bind)} LITERALLY — "
+        if stale.size == fresh.size
+          io << "#{stale.size == 1 ? "it is" : "they are"} spelled the BARE way and this "
+          io << "install reads #{spell("KEY", Namespace::Env)}/#{spell("NAME", Namespace::Bind)}, "
+          io << "so no binding will ever resolve #{stale.size == 1 ? "it" : "them"}. Write "
+          io << "`#{stale[0].remedy}`"
+        else
+          io << "nothing has bound #{fresh.size == 1 ? "it" : "them"} in this process (a "
+          io << "binding value is memory-only and every run starts with an empty table). "
+          io << "Bind first (`--bind-from`, a Repeater send under this slot), or write "
+          io << "`#{fresh[0].remedy}`"
+          unless stale.empty?
+            io << " — and `#{spell(stale[0].name, Namespace::Bind)}` for "
+            io << "#{token_list(stale.map(&.name), ns: Namespace::Bind)}, which "
+            io << "#{stale.size == 1 ? "is" : "are"} spelled the bare way this install no "
+            io << "longer reads"
           end
         end
       end
-      found.map(&.name)
+    end
+
+    # The sentence for slot header values naming `$ENV` vars (`SlotLiteral#env`, qualified
+    # names), for the send-time report and the surfaces that WRITE a slot. A warning, not a
+    # refusal: the slot may be meant for a project that has no such var by design.
+    def self.slot_env_note(names : Array(String)) : String
+      "#{token_list(names)} #{names.size == 1 ? "goes" : "go"} out LITERALLY — a session slot " \
+      "resolves #{spell("NAME", Namespace::Bind)} and #{spell("NAME", Namespace::Gen)} only, never " \
+      "an env var, so write the value itself"
+    end
+
+    # `slot_env_note` for one slot, or nil when its headers name no `$ENV` var.
+    def self.slot_env_warning(slot : SessionSlot) : String?
+      names = slot_literals(slot).select(&.env).map(&.name)
+      names.empty? ? nil : slot_env_note(names)
     end
 
     # Drain the record — `{slot name, binding name}` pairs, in the order they were first seen.

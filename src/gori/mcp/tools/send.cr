@@ -243,8 +243,9 @@ module Gori
       # asserts one origin across the group, and builds ONE plan over every member's request.
       private def build_race_plan(members : Array(Int64), force_http2 : Bool?, insecure : Bool,
                                   verbatim : Bool, timeout : Time::Span?, st : Store,
-                                  ob : Outbound) : {Repeater::Plan, Array(String)} | Result
+                                  ob : Outbound, what : String = "a race") : {Repeater::Plan, Array(String)} | Result
         loaded = [] of {Int64, Store::RepeaterRecord}
+        seeds = Set(Int64).new # the members still holding their flow seed's bytes (#1670)
         members.each do |id|
           rec = st.get_repeater_full(id)
           return not_found("no repeater with id #{id}") unless rec
@@ -255,6 +256,7 @@ module Gori
             return err("#{Repeater::DraftMarkers.refusal(id, MARKER_REMEDY)} NOTHING was sent.",
               "INVALID_ARGUMENT", field: "repeater_ids")
           end
+          seeds << id if Repeater::DraftMarkers.evidence?(st, rec)
           loaded << {id, rec}
         end
         overrides = Gori::HostOverrides.load(st)
@@ -279,7 +281,8 @@ module Gori
         labels = [] of String
         loaded.each do |(id, rec)|
           probe = begin
-            Repeater::Plan.build(race_member_options([rec.request], rec, insecure, overrides, verbatim, timeout, rec.http2?), ob)
+            Repeater::Plan.build(race_member_options([rec.request], rec, insecure, overrides, verbatim, timeout, rec.http2?,
+              seeds.includes?(id)), ob)
           rescue ex : Repeater::PlanError
             return send_plan_error(ex, "repeater_ids")
           end
@@ -293,9 +296,15 @@ module Gori
             "INVALID_ARGUMENT", field: "repeater_ids")
         end
 
+        # One plan, one provenance (#1670): see `DraftMarkers.mixed_group_refusal`.
+        captured = loaded.map { |(id, _)| seeds.includes?(id) }
+        if why = Repeater::DraftMarkers.mixed_group_refusal(captured, verbatim, what)
+          return err(why, "INVALID_ARGUMENT", field: "repeater_ids")
+        end
         anchor = loaded.first[1]
         plan = begin
-          Repeater::Plan.build(race_member_options(wires, anchor, insecure, overrides, verbatim, timeout, mode), ob)
+          Repeater::Plan.build(race_member_options(wires, anchor, insecure, overrides, verbatim, timeout, mode,
+            captured.all?), ob)
         rescue ex : Repeater::PlanError
           return send_plan_error(ex, "repeater_ids")
         end
@@ -306,8 +315,9 @@ module Gori
       # member's bytes and `rec` is the anchor). Mirrors the CLI's `session_plan_options`.
       private def race_member_options(requests : Array(Bytes), rec : Store::RepeaterRecord,
                                       insecure : Bool, overrides : Gori::HostOverrides?,
-                                      verbatim : Bool, timeout : Time::Span?, http2 : Bool) : Repeater::PlanOptions
-        Repeater::PlanOptions.new(requests,
+                                      verbatim : Bool, timeout : Time::Span?, http2 : Bool,
+                                      evidence : Bool) : Repeater::PlanOptions
+        Repeater::PlanOptions.new(requests, evidence: evidence,
           default_target: rec.target, http2: http2, sni: rec.sni, timeout: timeout,
           expand_request: !verbatim, expand_bindings: !verbatim, preserve_field_case: verbatim,
           auto_content_length: !verbatim && rec.auto_content_length?, verify: !insecure && @verify_upstream,
@@ -407,7 +417,7 @@ module Gori
 
         # The same origin/transport unification the race uses — a differential pair rides one
         # connection shape too, so a mismatch is refused rather than flattened.
-        built = build_race_plan(members, force_http2, insecure, verbatim, timeout, store, ob)
+        built = build_race_plan(members, force_http2, insecure, verbatim, timeout, store, ob, "a timing run")
         return built if built.is_a?(Result)
         plan, labels = built
 
@@ -1326,13 +1336,16 @@ module Gori
         verify = !bool_arg(h, "insecure", false) && @verify_upstream
         plan = begin
           Repeater::Plan.build(Repeater::PlanOptions.new([repeater.request],
+            # An untouched flow seed's handshake is evidence, as on `send_request` (#1670).
+            evidence: Repeater::DraftMarkers.evidence?(store, repeater),
             default_target: repeater.target, sni: repeater.sni, verify: verify,
             # `verbatim` reaches the handshake HEAD, exactly as `gori run repeater send`
             # threads it through `session_plan_options`. (The head deliberately does NOT take
             # the `seeded` provenance the MESSAGES take: `repeaters.request` is rewritable by
             # `update_repeater` while `flow_id` persists, so a flow id is not evidence that
             # THOSE bytes are still the capture's — while nothing but a flow seed ever writes
-            # a captured `ws_messages` row's payload.)
+            # a captured `ws_messages` row's payload. `evidence?` above compares the bytes
+            # themselves, which is what the flow id alone could not say.)
             expand_request: !verbatim,
             # …and its send-seam half, which the head needs for the same reason the MESSAGES
             # above needed `!verbatim`: `expand_request` stops the builder's env var pass, and
@@ -1555,6 +1568,9 @@ module Gori
           # outright, naming a variable nobody had typed.
           return {Repeater::PlanOptions.new([rec.request], default_target: rec.target,
             http2: bool_arg(h, "http2", rec.http2?), sni: send_sni(h, rec.sni),
+            # An unedited flow seed is a capture, not a draft: its `$ENV`/`$GEN` tokens go out
+            # literally, as in the Repeater tab and `gori run repeater send` (#1670).
+            evidence: Repeater::DraftMarkers.evidence?(store, rec),
             expand_request: !verbatim,
             # The SEND-seam half of the promise, and the one that was missing on all three
             # verbatim surfaces at once (#910): `expand_request` reaches the builder, while a

@@ -1,6 +1,13 @@
 require "../../spec_helper"
 
 module Gori::CLI::Run
+  # `repeater send`'s plan for session `rec` as `cmd_repeater_send` builds it.
+  def self.repeater_send_plan_for_spec(store : Store, rec : Store::RepeaterRecord, headers : Array(String)) : Repeater::Plan
+    req, pinned, evidence = session_send_request(store, rec, nil, headers, [] of String, false).as({Bytes?, Bool, Bool})
+    Repeater::Plan.build(session_plan_options(rec, true, nil, request: req.not_nil!, pinned_cl: pinned,
+      evidence: evidence, evidence_literals: seed_send_literals(rec, evidence)), ungated_outbound)
+  end
+
   def self.build_single_flow_request_for_spec(head : Bytes, body : Bytes, headers : Array(String),
                                               body_override : String?, target_override : String?,
                                               removed : Array(String) = [] of String) : {Bytes, Bool}
@@ -294,5 +301,77 @@ describe "gori run repeater h2 — --fields parsing" do
     _, body = Gori::CLI::Run.parse_h2_fields_file_for_spec(
       %({"fields":[[":method","POST"]],"body_base64":"AAECgP8="}))
     body.not_nil!.to_a.should eq([0x00, 0x01, 0x02, 0x80, 0xFF])
+  end
+end
+
+# #1670 review: `repeater send` on an untouched flow seed keeps it evidence and expands only the
+# operator's own `-H` (`per_send_request(expand: true)`), the way a flow replay merges them. The
+# captured tokens around them stay as captured; an unresolved `$ENV` the OPERATOR typed is refused.
+describe "gori run repeater send -H on an evidence session" do
+  it "expands the operator's -H value only, and refuses its unresolved $ENV token" do
+    saved = Gori::Settings.env_vars
+    Gori::Settings.env_vars = [{"TOKEN", "abc123"}]
+    with_env_syntax(Gori::Env::Syntax::Namespaced) do
+      wire = "GET / HTTP/1.1\r\nHost: h\r\nX-E: $ENV.TOKEN\r\nX-N: $ENV.NOPE\r\n\r\n".to_slice
+      bytes, _ = Gori::CLI::Run.per_send_request(wire, ["Y: $ENV.TOKEN"], [] of String, expand: true).as({Bytes, Bool})
+      sent = String.new(bytes)
+      sent.should contain("Y: abc123\r\n")
+      sent.should contain("X-E: $ENV.TOKEN\r\n")
+      sent.should contain("X-N: $ENV.NOPE\r\n")
+      expect_raises(Gori::Repeater::PlanError, /\$ENV\.NOPE/) do
+        Gori::CLI::Run.per_send_request(wire, ["Y: $ENV.NOPE"], [] of String, expand: true)
+      end
+      # A draft leaves the whole merge to the plan, which expands (and checks) it all.
+      draft, _ = Gori::CLI::Run.per_send_request(wire, ["Y: $ENV.TOKEN"], [] of String).as({Bytes, Bool})
+      String.new(draft).should contain("Y: $ENV.TOKEN\r\n")
+    end
+  ensure
+    Gori::Settings.env_vars = saved || [] of {String, String}
+  end
+end
+
+# Round 2 of the #1670 review: the session stays evidence under the operator's `-H`, but only the
+# capture's own names stay literal at the send seam; a `$GEN` the operator added still mints.
+describe "gori run repeater send -H on an evidence session, end to end" do
+  it "keeps the captured $ENV/$GEN literal and mints the operator's $GEN" do
+    with_store_env do |store|
+      saved = Gori::Settings.env_vars
+      Gori::Settings.env_vars = [{"TOKEN", "abc123"}]
+      with_env_syntax(Gori::Env::Syntax::Namespaced) do
+        fid = store.insert_flow(Gori::Store::CapturedRequest.new(
+          created_at: 1_i64, scheme: "http", host: "h.test", port: 80,
+          method: "GET", target: "/ev", http_version: "HTTP/1.1",
+          head: "GET /ev HTTP/1.1\r\nHost: h.test\r\nX-E: $ENV.TOKEN\r\nX-G: $GEN.UUID\r\n\r\n".to_slice,
+          body: nil, source: Gori::FlowSource::Kind::Import))
+        seed = Gori::Repeater::FlowRequest.build(store.get_flow(fid).not_nil!).bytes
+        id = store.insert_repeater("http://h.test", seed, false, true, fid, 0)
+        rec = store.get_repeater(id).not_nil!
+        wire = String.new(Gori::CLI::Run.repeater_send_plan_for_spec(store, rec, ["Z: $GEN.RANDOM_HEX", "Y: $ENV.TOKEN"]).wire_bytes)
+        wire.should contain("X-E: $ENV.TOKEN\r\n")
+        wire.should contain("X-G: $GEN.UUID\r\n")
+        wire.should contain("Y: abc123\r\n")
+        wire.should match(/\r\nZ: [0-9a-f]{32}\r\n/)
+      end
+    ensure
+      Gori::Settings.env_vars = saved || [] of {String, String}
+    end
+  end
+end
+
+# A race or timing group rides one plan, so a seed beside a draft is refused (#1670), as the TUI
+# race and MCP `race_requests` refuse it, worded for the command that sends it.
+describe "gori run repeater race/timing — mixed provenance" do
+  it "refuses a group mixing an untouched seed and a draft, unless --verbatim" do
+    a = Gori::Store::RepeaterRecord.new(1_i64, "http://h.test", "GET /a HTTP/1.1\r\n\r\n".to_slice, false, true, 9_i64, 0)
+    b = Gori::Store::RepeaterRecord.new(2_i64, "http://h.test", "GET /b HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
+    loaded = [{1_i64, a}, {2_i64, b}]
+    race = Gori::CLI::Run.race_provenance_refusal(loaded, Set{1_i64}, false, "gori run repeater race").not_nil!
+    race.should start_with("gori run repeater race: the sessions mix captured requests")
+    race.should contain("a race needs one provenance")
+    Gori::CLI::Run.race_provenance_refusal(loaded, Set{1_i64}, false, "gori run repeater timing").not_nil!
+      .should contain("a timing run needs one provenance")
+    Gori::CLI::Run.race_provenance_refusal(loaded, Set{1_i64}, true, "gori run repeater race").should be_nil
+    Gori::CLI::Run.race_provenance_refusal(loaded, Set{1_i64, 2_i64}, false, "gori run repeater race").should be_nil
+    Gori::CLI::Run.race_provenance_refusal(loaded, Set(Int64).new, false, "gori run repeater race").should be_nil
   end
 end

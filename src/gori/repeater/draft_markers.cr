@@ -1,5 +1,6 @@
 require "../store"
 require "../fuzz/template"
+require "./flow_request"
 
 module Gori::Repeater
   # The one predicate the headless send seams ask before replaying a saved session:
@@ -56,6 +57,33 @@ module Gori::Repeater
       fid = rec.flow_id
       return true unless fid
       operator_marked?(store, fid)
+    end
+
+    # Whether the session is still EVIDENCE: seeded from a flow (`flow_id`) and still holding exactly
+    # the bytes that seed produced (`FlowRequest.build`, in either request-line form, since
+    # `--keep-request-line` / MCP `keep_request_line` stores the absolute one), so a `$ENV`/`$GEN`
+    # token in it is one the capture brought and goes out literally (#1670), as in the Repeater
+    # tab. Asked of the STORED row: a send's own `--path`/`-H` leaves it evidence and expands only
+    # what the operator added, as a flow replay does. An edited row is the operator's draft again,
+    # and so is one whose seed is gone: nothing is left to tell the capture's tokens from typed ones.
+    def self.evidence?(store : Store, rec : Store::RepeaterRecord) : Bool
+      return false unless (fid = rec.flow_id) && (detail = store.get_flow(fid))
+      FlowRequest.build(detail).bytes == rec.request ||
+        FlowRequest.build(detail, rewrite_absolute_form: false).bytes == rec.request
+    rescue FlowRequest::PseudoHeaderHead
+      false
+    end
+
+    # Why a race/timing group whose members' `evidence?` answers are `captured` cannot ride one
+    # plan, or nil. The group is one Sender, so an untouched seed beside a draft would have its
+    # captured tokens expanded as the draft's (#1670); the TUI race refuses the same group. A
+    # verbatim group expands no member, so it has nothing to mix.
+    # `what` names the group the caller sends ("a race", "a timing run").
+    def self.mixed_group_refusal(captured : Array(Bool), verbatim : Bool, what : String = "a race") : String?
+      return nil if verbatim || captured.all? || captured.none?
+      "the sessions mix captured requests (untouched flow seeds) and drafts — #{what} needs one " \
+      "provenance (all captured or all drafts), so the seeds' own tokens are not expanded as a " \
+      "draft's. Send them separately, or edit the seeds into drafts"
     end
 
     # `RepeaterView#adopt_capture_markers`' test, asked of the store instead of the tab: did

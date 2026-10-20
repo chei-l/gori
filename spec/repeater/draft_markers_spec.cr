@@ -146,6 +146,192 @@ describe Gori::Repeater::DraftMarkers do
   end
 end
 
+# #1670: a flow-seeded session whose bytes are still the seed's is EVIDENCE, so its captured
+# `$ENV`/`$GEN` tokens go out as the capture had them, as the Repeater tab sends them.
+describe "Gori::Repeater::DraftMarkers.evidence?" do
+  it "is true only while a flow-seeded session holds its seed's bytes untouched" do
+    with_store_env do |store|
+      fid = seed_flow(store, "POST /l HTTP/1.1\r\nHost: a.test\r\nX-E: $ENV.TOKEN\r\n\r\nid=$GEN.UUID")
+      seed = String.new(Gori::Repeater::FlowRequest.build(store.get_flow(fid).not_nil!).bytes)
+      DM.evidence?(store, rec_for(seed, flow_id: fid)).should be_true
+      DM.evidence?(store, rec_for(seed.sub("id=", "id=x"), flow_id: fid)).should be_false
+      DM.evidence?(store, rec_for(seed)).should be_false
+      DM.evidence?(store, rec_for(seed, flow_id: 4242_i64)).should be_false
+    end
+  end
+
+  # `--keep-request-line` / MCP `keep_request_line` seeds the ABSOLUTE form, which the default
+  # origin-form build never equals; either seed is untouched evidence.
+  it "accepts a seed kept in absolute form" do
+    with_store_env do |store|
+      fid = seed_flow(store, "GET http://a.test/abs HTTP/1.1\r\nHost: a.test\r\nX-N: $ENV.NOPE\r\n\r\n")
+      detail = store.get_flow(fid).not_nil!
+      kept = String.new(Gori::Repeater::FlowRequest.build(detail, rewrite_absolute_form: false).bytes)
+      kept.should start_with("GET http://a.test/abs ")
+      DM.evidence?(store, rec_for(kept, flow_id: fid)).should be_true
+      DM.evidence?(store, rec_for(String.new(Gori::Repeater::FlowRequest.build(detail).bytes), flow_id: fid)).should be_true
+    end
+  end
+end
+
+# An origin that answers every connection 204 and hands each request head to `sink`, for the
+# replay paths that open more than one connection (a race).
+private def start_recording_origin_many(sink : Channel(String)) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    while conn = origin.accept?
+      spawn_with(conn) do |c|
+        head = Gori::Proxy::Codec::Http1.read_head(c)
+        sink.send(head ? String.new(head) : "") rescue nil
+        c << "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n" rescue nil
+        c.flush rescue nil
+        c.close rescue nil
+      end
+    end
+  rescue
+  end
+  port
+end
+
+# A captured flow holding `X-N: $ENV.NOPE`, and an untouched repeater seed of it.
+private def evidence_seed(store, port : Int32, path : String = "/ev") : Int64
+  fid = store.insert_flow(Gori::Store::CapturedRequest.new(
+    created_at: 1_i64, scheme: "http", host: "127.0.0.1", port: port,
+    method: "GET", target: path, http_version: "HTTP/1.1",
+    head: "GET #{path} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-N: $ENV.NOPE\r\n\r\n".to_slice,
+    body: nil, source: Gori::FlowSource::Kind::Import))
+  seed = Gori::Repeater::FlowRequest.build(store.get_flow(fid).not_nil!).bytes
+  store.insert_repeater("http://127.0.0.1:#{port}", seed, false, true, fid, 0)
+end
+
+# #1670 review: every replay of a saved session, not only `repeater send`, treats an untouched
+# seed as evidence, so a captured `$ENV.NOPE` goes out as captured instead of being refused.
+describe "replaying an untouched flow seed beyond repeater send (#1670)" do
+  it "a retest step sends the capture's unresolved $ENV token literally" do
+    with_store_env do |store|
+      with_env_syntax(Gori::Env::Syntax::Namespaced) do
+        sink = Channel(String).new(4)
+        port = start_recording_origin_many(sink)
+        rid = evidence_seed(store, port)
+        step = Gori::Store::RetestStep.new(1_i64, 1_i64, 1, Gori::Store::RetestRole::Variant,
+          Gori::Store::LinkRefKind::Repeater, rid, "", 0_i64, 0_i64)
+        planned = Gori::Retest::Planned.new(step, "GET", "http://127.0.0.1:#{port}/ev", "repeater ##{rid}")
+        backend = Gori::Retest::LiveBackend.new(store, ungated_outbound,
+          issue_id: 1_i64, surface: Gori::FlowSource::Surface::Cli)
+        obs = backend.send(planned)
+        obs.error.should be_nil
+        obs.status.should eq(204)
+        sink.receive.should contain("X-N: $ENV.NOPE\r\n")
+        backend.finish
+      end
+    end
+  end
+
+  it "MCP race_requests races untouched seeds without refusing their captured tokens" do
+    with_store_env do |store|
+      with_env_syntax(Gori::Env::Syntax::Namespaced) do
+        sink = Channel(String).new(4)
+        port = start_recording_origin_many(sink)
+        a = evidence_seed(store, port, "/a")
+        b = evidence_seed(store, port, "/b")
+        r = tools_for(store).call("race_requests", JSON.parse(%({"repeater_ids":[#{a},#{b}],"allow_unscoped":true})))
+        r.is_error.should be_false
+        r.text.should_not contain("unresolved env")
+        2.times { sink.receive.should contain("X-N: $ENV.NOPE\r\n") }
+      end
+    end
+  end
+
+  # One plan rides one Sender, so a seed beside a draft would be expanded as the draft is: the
+  # group is refused, as the TUI race refuses a group whose provenance differs. Nothing dials.
+  it "MCP race_requests refuses a group mixing an untouched seed and a draft" do
+    with_store_env do |store|
+      with_env_syntax(Gori::Env::Syntax::Namespaced) do
+        sink = Channel(String).new(4)
+        port = start_recording_origin_many(sink)
+        seed = evidence_seed(store, port, "/a")
+        draft = store.insert_repeater("http://127.0.0.1:#{port}",
+          "GET /b HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_slice, false, true, nil, 0)
+        r = tools_for(store).call("race_requests", JSON.parse(%({"repeater_ids":[#{seed},#{draft}],"allow_unscoped":true})))
+        r.is_error.should be_true
+        r.error_code.should eq("INVALID_ARGUMENT")
+        r.text.should contain("mix captured requests")
+      end
+    end
+  end
+
+  it "MCP minimize_repeater minimizes an untouched seed as captured, never with the secret" do
+    with_store_env do |store|
+      saved = Gori::Settings.env_vars
+      Gori::Settings.env_vars = [{"TOKEN", "abc123"}]
+      with_env_syntax(Gori::Env::Syntax::Namespaced) do
+        sink = Channel(String).new(1000)
+        port = start_recording_origin_many(sink)
+        fid = store.insert_flow(Gori::Store::CapturedRequest.new(
+          created_at: 1_i64, scheme: "http", host: "127.0.0.1", port: port,
+          method: "GET", target: "/ev?a=1&b=2", http_version: "HTTP/1.1",
+          head: "GET /ev?a=1&b=2 HTTP/1.1\r\nHost: 127.0.0.1\r\nX-E: $ENV.TOKEN\r\n\r\n".to_slice,
+          body: nil, source: Gori::FlowSource::Kind::Import))
+        seed = Gori::Repeater::FlowRequest.build(store.get_flow(fid).not_nil!).bytes
+        id = store.insert_repeater("http://127.0.0.1:#{port}", seed, false, true, fid, 0)
+        r = tools_for(store).call("minimize_repeater", JSON.parse(%({"repeater_id":#{id},"allow_unscoped":true})))
+        r.text.should_not contain("abc123")
+        r.is_error.should be_false
+        # Every probe's head reached the sink before its answer, so the call returning means all are in.
+        heads = [] of String
+        loop do
+          select
+          when h = sink.receive
+            heads << h
+          else
+            break
+          end
+        end
+        heads.should_not be_empty
+        heads.none?(&.includes?("abc123")).should be_true
+      end
+    ensure
+      Gori::Settings.env_vars = saved || [] of {String, String}
+    end
+  end
+end
+
+describe "MCP send_request{repeater_id} — captured tokens on an unedited flow seed (#1670)" do
+  it "sends them literally, and expands them once the session is edited" do
+    with_store_env do |store|
+      Gori::Settings.env_vars = [{"TOKEN", "abc123"}]
+      with_env_syntax(Gori::Env::Syntax::Namespaced) do
+        sink = Channel(Bytes).new(1)
+        port = start_recording_origin(sink)
+        flow_id = store.insert_flow(Gori::Store::CapturedRequest.new(
+          created_at: 1_i64, scheme: "http", host: "127.0.0.1", port: port,
+          method: "GET", target: "/ev", http_version: "HTTP/1.1",
+          head: "GET /ev HTTP/1.1\r\nHost: 127.0.0.1\r\nX-E: $ENV.TOKEN\r\nX-G: $GEN.UUID\r\n\r\n".to_slice,
+          body: nil, source: Gori::FlowSource::Kind::Import))
+        seed = Gori::Repeater::FlowRequest.build(store.get_flow(flow_id).not_nil!).bytes
+        id = store.insert_repeater("http://127.0.0.1:#{port}", seed, false, true, flow_id, 0)
+        args = JSON.parse(%({"repeater_id":#{id},"allow_unscoped":true,"record_history":false}))
+        tools_for(store).call("send_request", args).is_error.should be_false
+        wire = String.new(sink.receive)
+        wire.should contain("X-E: $ENV.TOKEN\r\n")
+        wire.should contain("X-G: $GEN.UUID\r\n")
+
+        sink2 = Channel(Bytes).new(1)
+        port2 = start_recording_origin(sink2)
+        edited = String.new(seed).sub("GET /ev", "GET /ev2")
+        store.update_repeater(id, "http://127.0.0.1:#{port2}", edited.to_slice, false, true).should be_true
+        tools_for(store).call("send_request", args).is_error.should be_false
+        wire2 = String.new(sink2.receive)
+        wire2.should contain("X-E: abc123\r\n")
+        wire2.should_not contain("$GEN.UUID")
+      end
+    ensure
+      Gori::Settings.env_vars = [] of {String, String}
+    end
+  end
+end
+
 describe "MCP send_request — a session whose §…§ the tab would render (#1068)" do
   it "refuses a send from a session with no source flow, and records no History flow" do
     with_store_env do |store|
