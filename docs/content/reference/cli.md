@@ -710,6 +710,8 @@ gori run fuzz save 42 --auto --preset sqli
 gori run fuzz save --request request.txt --target https://api.example.com --project acme --payloads a,b
 ```
 
+`fuzz save` answers with the saved run: under `--format jsonl` its last line is `{"run_id":N,"save_status":"done","saved_results":K}` (with `save_error` when the save failed), and under `--format json` the result array sits in an object beside those fields, `{"results":[…],"run_id":N,…}`. Plain `fuzz` output is unchanged.
+
 A file/stdin save needs `--project`, `--db` or `GORI_PROJECT`; gori will not silently write a project-less sweep into whichever project happens to be most recent. `--record-history` remains independent: it controls History flows, not the saved result set.
 
 | Command | Description |
@@ -1449,13 +1451,15 @@ gori run rewriter rm 3
 | `--from-flow=ID` | `short_circuit`: copy flow ID's captured response into the rule. `--find`, `--host` and `--value` override what it drafts |
 | `-f`, `--find=FIND` | Required, except with `--from-flow` or `--map-dir --strip-prefix`. The literal, pattern, header name, or (json ops) JSON path such as `$.user.role` to act on |
 | `-v`, `--value=VALUE` | Replacement text, header value, the new value as JSON text for `json_set` (`'"admin"'`, `true`), or (with `--op=pipe`) the COMMAND to run. See [Process hooks](/guide/scripting/#process-hooks) |
-| `--host=GLOB` | Limit the rule to a host and its subdomains (`example.com` also matches `api.example.com`, but not `xexample.com`); `*` is the explicit wildcard. Omit to apply everywhere |
+| `--host=GLOB` | Limit the rule to a host and its subdomains (`example.com` also matches `api.example.com`, but not `xexample.com`); `*` is the explicit wildcard. A port, scheme or path is refused: the rule matches the host on every port. Omit to apply everywhere |
 | `--name=NAME` | Label shown in the rule list |
 | `--disabled` | Create the rule without arming it |
 | `--scope=SCOPE` | `project` (default) or `global`. A global rule lives in `settings.json` and applies in every project. On the bare listing: show only that store's rules (default: both) |
 | `--everywhere` | On `enable`/`disable` of a global rule: change the rule's own default instead of this project's override |
 
-`preview` takes the same rule flags and reports how many stored flows the rule would have changed, without writing it. `rm` (`delete`), `enable` and `disable` take a rule id from the list, plus `--scope`, because the two stores number their rules independently, so an id alone names two different rules. The list prints the scope as a `G`/`P` prefix (`G*` = this project overrides that global rule's default) and shows global rules first, the order the proxy applies them in. See [Global and project rules](/guide/proxy/#global-and-project-rules).
+A request-head rule matches the origin-form request line the proxy forwards (`GET /path`), never the absolute form (`GET http://host/path`) History stores for a plain-HTTP proxy flow, so write `--find 'GET /path'`.
+
+`preview` takes the same rule flags and reports how many stored flows the rule would have changed, without writing it. Its `--format json` carries `skipped`, the flows a JSON rule left out because their body was too large to preview, and `scan_capped`, true only when older flows than the 500 it read exist. `rm` (`delete`), `enable` and `disable` take a rule id from the list, plus `--scope`, because the two stores number their rules independently, so an id alone names two different rules. The list prints the scope as a `G`/`P` prefix (`G*` = this project overrides that global rule's default) and shows global rules first, the order the proxy applies them in. See [Global and project rules](/guide/proxy/#global-and-project-rules).
 
 Body rules re-sync `Content-Length` and de-chunk as needed, on HTTP/1.1 and HTTP/2 alike. See [Proxy & History](/guide/proxy/) for the interactive editor.
 
@@ -1467,7 +1471,7 @@ gori run rewriter preset add unhide-hidden-fields
 gori run rewriter preset add remove-csp --scope global --disabled
 ```
 
-Names are `unhide-hidden-fields`, `enable-disabled-fields`, `remove-length-limits`, `strip-validation`, `remove-csp`, `remove-security-headers` and `disable-sri`. `add` takes `--scope=project|global` and `--disabled` (install without arming, to review them first). The rules it writes go through the same path `rewriter add` does, so they are listed, editable and deletable afterwards. Installing the same preset twice duplicates visibly rather than merging.
+Names are `unhide-hidden-fields`, `enable-disabled-fields`, `remove-length-limits`, `strip-validation`, `remove-csp`, `remove-security-headers` and `disable-sri`. `add` takes `--scope=project|global`, `--disabled` (install without arming, to review them first) and `--format json`, which prints MCP `create_rule_from_preset`'s object, the new rules' `ids` among it. The rules it writes go through the same path `rewriter add` does, so they are listed, editable and deletable afterwards. Installing the same preset twice duplicates visibly rather than merging.
 
 **`rewriter extract`**: the rules that declare [session bindings](/guide/proxy/#session-bindings): which response a `$BIND.NAME` is read from, and where in it. Verbs: `list` (default), `add`, `rm` (`delete`), `enable`, `disable`.
 

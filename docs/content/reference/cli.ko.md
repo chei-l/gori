@@ -701,6 +701,8 @@ gori run fuzz save 42 --auto --preset sqli
 gori run fuzz save --request request.txt --target https://api.example.com --project acme --payloads a,b
 ```
 
+`fuzz save`는 저장된 실행으로 답합니다. `--format jsonl`에서는 마지막 줄이 `{"run_id":N,"save_status":"done","saved_results":K}`이고(저장이 실패하면 `save_error`가 붙음), `--format json`에서는 결과 배열이 그 필드들과 함께 객체 안에 담깁니다(`{"results":[…],"run_id":N,…}`). 일반 `fuzz` 출력은 바뀌지 않습니다.
+
 파일/stdin에서 저장할 때는 `--project`, `--db`, `GORI_PROJECT` 중 하나가 필요합니다. 프로젝트를 지정하지 않은 스윕을 가장 최근 프로젝트에 조용히 써넣지 않기 때문입니다. `--record-history`는 이와 별개로 남습니다. 저장된 결과 집합이 아니라 History 플로우를 제어합니다.
 
 | 명령 | 설명 |
@@ -1440,13 +1442,15 @@ gori run rewriter rm 3
 | `--from-flow=ID` | `short_circuit`: flow ID의 캡처된 응답을 규칙에 복사. `--find`, `--host`, `--value`가 초안을 덮어씀 |
 | `-f`, `--find=FIND` | `--from-flow`나 `--map-dir --strip-prefix`가 아니면 필수. 대상이 되는 리터럴, 패턴, 헤더 이름, 또는 (json 동작) `$.user.role` 같은 JSON 경로 |
 | `-v`, `--value=VALUE` | 치환할 텍스트, 헤더 값, `json_set`의 새 값(JSON 텍스트: `'"admin"'`, `true`), 또는 `--op=pipe`일 때 실행할 명령. [프로세스 훅](/ko/guide/scripting/#process-hooks) 참고 |
-| `--host=GLOB` | 규칙을 그 호스트와 서브도메인으로 한정(`example.com`은 `api.example.com`에도 매칭되지만 `xexample.com`에는 매칭되지 않음). `*`는 명시적 와일드카드. 생략하면 전체 적용 |
+| `--host=GLOB` | 규칙을 그 호스트와 서브도메인으로 한정(`example.com`은 `api.example.com`에도 매칭되지만 `xexample.com`에는 매칭되지 않음). `*`는 명시적 와일드카드. 포트, 스킴, 경로는 거부(규칙은 모든 포트에서 그 호스트에 매칭). 생략하면 전체 적용 |
 | `--name=NAME` | 규칙 목록에 표시할 라벨 |
 | `--disabled` | 규칙을 만들되 활성화하지 않음 |
 | `--scope=SCOPE` | `project`(기본값) 또는 `global`. 전역 규칙은 `settings.json`에 저장되어 모든 프로젝트에 적용됨. 목록에서는 그 저장소의 규칙만 표시(기본: 둘 다) |
 | `--everywhere` | 전역 규칙의 `enable`/`disable`에서, 이 프로젝트의 오버라이드 대신 규칙 자체의 기본값을 변경 |
 
-`preview`는 같은 규칙 플래그를 받아, 규칙을 저장하지 않고 저장된 플로우 중 몇 개가 바뀌었을지 보고합니다. `rm`(`delete`), `enable`, `disable`은 목록의 규칙 id와 함께 `--scope`도 받습니다. 두 저장소가 규칙 번호를 각자 매기므로 id 하나가 서로 다른 두 규칙을 가리키기 때문입니다. 목록은 범위를 `G`/`P` 접두어로 출력하고(`G*`는 이 프로젝트가 해당 전역 규칙의 기본값을 오버라이드했다는 뜻), 프록시가 적용하는 순서 그대로 전역 규칙을 먼저 보여 줍니다. [전역 규칙과 프로젝트 규칙](/ko/guide/proxy/#global-and-project-rules)을 참고하세요.
+요청 헤드 규칙은 프록시가 전달하는 origin-form 요청 줄(`GET /path`)에 매칭되며, 평문 HTTP 프록시 플로우에 History가 저장하는 absolute-form(`GET http://host/path`)에는 매칭되지 않습니다. 그러니 `--find 'GET /path'`로 쓰세요.
+
+`preview`는 같은 규칙 플래그를 받아, 규칙을 저장하지 않고 저장된 플로우 중 몇 개가 바뀌었을지 보고합니다. `--format json`에는 `skipped`(본문이 너무 커서 JSON 규칙이 미리보기에서 뺀 플로우 수)와, 읽은 500개보다 오래된 플로우가 있을 때만 참인 `scan_capped`가 담깁니다. `rm`(`delete`), `enable`, `disable`은 목록의 규칙 id와 함께 `--scope`도 받습니다. 두 저장소가 규칙 번호를 각자 매기므로 id 하나가 서로 다른 두 규칙을 가리키기 때문입니다. 목록은 범위를 `G`/`P` 접두어로 출력하고(`G*`는 이 프로젝트가 해당 전역 규칙의 기본값을 오버라이드했다는 뜻), 프록시가 적용하는 순서 그대로 전역 규칙을 먼저 보여 줍니다. [전역 규칙과 프로젝트 규칙](/ko/guide/proxy/#global-and-project-rules)을 참고하세요.
 
 본문 규칙은 HTTP/1.1과 HTTP/2 모두에서 필요에 따라 `Content-Length`를 다시 맞추고 청크를 해제합니다. 대화형 편집기는 [Proxy & History](/ko/guide/proxy/)를 참고하세요.
 
@@ -1458,7 +1462,7 @@ gori run rewriter preset add unhide-hidden-fields
 gori run rewriter preset add remove-csp --scope global --disabled
 ```
 
-이름은 `unhide-hidden-fields`, `enable-disabled-fields`, `remove-length-limits`, `strip-validation`, `remove-csp`, `remove-security-headers`, `disable-sri`입니다. `add`는 `--scope=project|global`과 `--disabled`(무장하지 않고 설치해 먼저 검토)를 받습니다. 설치되는 규칙은 `rewriter add`와 같은 경로를 지나므로 이후에도 목록에 나오고 편집·삭제됩니다. 같은 프리셋을 두 번 설치하면 병합되지 않고 눈에 보이게 중복됩니다.
+이름은 `unhide-hidden-fields`, `enable-disabled-fields`, `remove-length-limits`, `strip-validation`, `remove-csp`, `remove-security-headers`, `disable-sri`입니다. `add`는 `--scope=project|global`, `--disabled`(무장하지 않고 설치해 먼저 검토), `--format json`을 받습니다. `--format json`은 MCP `create_rule_from_preset`의 객체를 출력하며, 새 규칙의 `ids`도 거기 담깁니다. 설치되는 규칙은 `rewriter add`와 같은 경로를 지나므로 이후에도 목록에 나오고 편집·삭제됩니다. 같은 프리셋을 두 번 설치하면 병합되지 않고 눈에 보이게 중복됩니다.
 
 **`rewriter extract`**: [세션 바인딩](/ko/guide/proxy/#session-bindings)을 선언하는 규칙입니다. `$BIND.NAME`을 어느 응답의 어디에서 읽을지 정합니다. 동사: `list`(기본), `add`, `rm`(`delete`), `enable`, `disable`.
 
