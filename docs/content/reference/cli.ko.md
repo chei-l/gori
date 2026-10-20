@@ -62,7 +62,7 @@ gori run <subcommand> [verb] [options]
 | `diff --from A --to B` | 리테스트 리포트: 프로젝트 두 개를 엔드포인트 단위로 비교 (added / gone / changed / unchanged / removed) |
 | `intercept` | 캡처 중인 TUI의 라이브 인터셉트 큐 조회 및 조작 |
 | `send [URL]` | Repeater 세션을 만들지 않고, URL(curl 형태) 또는 원시 요청으로 조립한 요청 하나를 전송 |
-| `repeater <flow-id>` · `list` · `create` · `send` | 캡처한 플로우 재전송, 또는 Repeater 세션 목록 / 생성 / 실행 (WebSocket 포함) |
+| `repeater <flow-id>` · `list` · `create` · `update` · `send` | 캡처한 플로우 재전송, 또는 Repeater 세션 목록 / 생성 / 수정 / 실행 (WebSocket 포함) |
 | `repeater ws <id>` | 저장된 repeater로 지속 WebSocket 세션을 열고 stdin/stdout으로 프레임 스트리밍 |
 | `repeater race <id> <id>…` | 저장된 세션 여러 개를 하나의 동기화된 레이스로 발사(HTTP/1.1 last-byte sync, HTTP/2 single-packet) |
 | `repeater timing <id> <id>` | 저장된 세션 두 개의 차등 타이밍 분석: 응답 순서와 사분위수로 어느 쪽이 일관되게 느린지 판정 |
@@ -495,6 +495,9 @@ pbpaste | gori run repeater create --curl - --name "from devtools"
 넷 중 어느 하나와도 함께 쓸 수 있습니다. `--curl`은 curl 명령 하나를 읽고
 ([Repeater → Paste cURL](/ko/guide/repeater-and-fuzzer/#repeater) 참고), 따로 주지 않으면
 `--target`과 `--http2`도 그 명령에서 가져옵니다.
+어떤 전송도 닿을 수 없는 대상(http/https/ws/wss가 아닌 스킴, 65535를 넘는 포트, 공백이 든 호스트)은
+MCP `create_repeater`처럼 생성 시점에 거부합니다. `--tags`는 MCP와 같은 방식으로 저장되고
+(`#idor, x,,#IDOR`는 `idor x`가 되며 `#`는 아무것도 저장하지 않음), 빈 `--name`은 탭을 `Untitled`로 둡니다.
 
 `--request-stdin`은 파이프나 리다이렉트(`--request-stdin < req.http`)를 읽으며, 터미널은
 거부합니다. 터미널은 입력한 바이트를 그대로 되돌려 출력하므로, `Cookie`와 `Authorization`을
@@ -534,6 +537,13 @@ pbpaste | gori run repeater create --curl - --name "from devtools"
 ```bash
 id=$(gori run repeater create -t https://api.example.com -f req.http --format json | jq .id)
 gori run repeater send "$id"
+```
+
+**`repeater update <repeater-id>`**: 저장된 세션을 그 자리에서 수정합니다. MCP `update_repeater`의 헤드리스 형태입니다. id가 그대로이므로 이 세션을 가리키는 리테스트 단계와 링크도 계속 동작합니다(삭제 후 다시 만들면 끊깁니다). 주지 않은 플래그는 저장된 값을 유지합니다. `--target`(`create`처럼 검사), `-f`/`--request-file`, `-r`/`--request-raw`, `--request-stdin`(`create`처럼 하나만), `--name`과 `--tags`(`''`는 비움), `--http2` / `--http1`, `--sni`(`''`는 비움), `--no-auto-cl` / `--auto-cl`. `--format json`은 `repeater list --format json`과 같은 모양으로 세션을 찍습니다.
+
+```bash
+gori run repeater update 7 --target https://staging.example.com --tags "idor auth"
+generate-request | gori run repeater update 7 --request-stdin
 ```
 
 **`repeater send <repeater-id>`**: 저장된 세션을 실행합니다. HTTP와 WebSocket 모두 해당됩니다.
@@ -596,7 +606,7 @@ gori run repeater move 5 --down
 
 **`repeater delete <repeater-id> [<repeater-id>…] --yes`**: 저장된 세션 하나 이상을 닫고 스트립의 번호를 다시 매깁니다. `--yes`는 필수이며, 첫 삭제 전에 모든 id를 검사합니다. 하나라도 모르는 id가 있으면 호출 전체를 거절하므로, 오타 하나로 워크벤치가 절반만 비는 일은 없습니다. 각 줄은 그 세션이 *가지고 있던* 탭 번호를 말합니다(무엇이든 밀려나기 전에 한 번만 읽습니다). `--format json`은 `deleted`(`was_tui_index` 포함), `failed`, `remaining`을 반환합니다. 지우지 못한 세션이 있으면 종료 코드가 0이 아닙니다.
 
-**`repeater race <repeater-id> <repeater-id> [<repeater-id>…]`**: 저장된 세션 여러 개를 하나의 동기화된 레이스로 발사해, 서로 다른 N개의 요청이 좁은 한 순간에 서버에 닿게 합니다(서로 다른 엔드포인트에 걸친 TOCTOU). HTTP/1.1에서는 요청마다 연결을 따로 열고 모든 요청의 마지막 바이트를 함께 풀어 주며, HTTP/2에서는 한 연결을 공유하는 single-packet 공격으로 보냅니다. 모든 세션은 하나의 오리진으로 해소되고 같은 전송을 써야 하며, 아니면 레이스를 거부합니다. `--http2` / `--http1`은 세션에 저장된 설정을 덮어쓰고, `--max-requests=N`은 N보다 큰 묶음을 나누지 않고 거부합니다. `--verbatim`, `--slot=NAME`, `--reframe-grpc`, `--tls-preset=NAME`, `-k`, `--timeout`, `--allow-unscoped`, `--format text|json`은 `repeater send`와 같습니다. 요청 *하나*의 복사본 여러 개로 레이스하려면 `fuzz --race=N`을 쓰세요.
+**`repeater race <repeater-id> <repeater-id> [<repeater-id>…]`**: 저장된 세션 여러 개를 하나의 동기화된 레이스로 발사해, 서로 다른 N개의 요청이 좁은 한 순간에 서버에 닿게 합니다(서로 다른 엔드포인트에 걸친 TOCTOU). HTTP/1.1에서는 요청마다 연결을 따로 열고 모든 요청의 마지막 바이트를 함께 풀어 주며, HTTP/2에서는 한 연결을 공유하는 single-packet 공격으로 보냅니다. 모든 세션은 하나의 오리진으로 해소되고 같은 전송을 써야 하며, 아니면 레이스를 거부합니다. `--http2` / `--http1`은 세션에 저장된 설정을 덮어쓰고, `--max-requests=N`은 N보다 큰 묶음을 나누지 않고 거부합니다. `--verbatim`, `--slot=NAME`, `--reframe-grpc`, `--tls-preset=NAME`, `-k`, `--timeout`, `--allow-unscoped`, `--format text|json`은 `repeater send`와 같습니다. `--format json`은 MCP `race_requests`가 돌려주는 객체입니다. `responded`와 `won_2xx` 개수, 그리고 멤버마다 세션 `id`, 상태, 크기, 타이밍, 응답 `head`와 `body`(`repeater send`와 같은 모양)가 담깁니다. 레이스는 저장되지 않으므로 본문은 여기에만 남고, `--max-body=BYTES`로 각각을 자를 수 있습니다. 요청 *하나*의 복사본 여러 개로 레이스하려면 `fuzz --race=N`을 쓰세요.
 
 ```bash
 gori run repeater race 3 4 --http2

@@ -62,7 +62,7 @@ gori run <subcommand> [verb] [options]
 | `diff --from A --to B` | Retest report: diff two projects at endpoint scale (added / gone / changed / unchanged / removed) |
 | `intercept` | Inspect and drive a capturing TUI's live intercept queue |
 | `send [URL]` | Send one request built from a URL (curl-shaped) or a raw request, without creating a Repeater session |
-| `repeater <flow-id>` · `list` · `create` · `send` | Re-send a captured flow, or list / create / execute Repeater sessions (incl. WebSocket) |
+| `repeater <flow-id>` · `list` · `create` · `update` · `send` | Re-send a captured flow, or list / create / edit / execute Repeater sessions (incl. WebSocket) |
 | `repeater ws <id>` | Open a persistent WebSocket session on a saved repeater; stream frames from stdin to stdout |
 | `repeater race <id> <id>…` | Fire several saved sessions as one synchronized race (HTTP/1.1 last-byte sync, HTTP/2 single-packet) |
 | `repeater timing <id> <id>` | Differential timing analysis of two saved sessions: which one is consistently slower, by response order and quartiles |
@@ -502,6 +502,10 @@ or a pipe that produced nothing) is refused instead of creating a session that c
 `--flow` is not one of the four: it doubles as provenance, so it pairs with any one of them.
 `--curl` reads one curl command (see [Repeater → Paste cURL](/guide/repeater-and-fuzzer/#repeater))
 and supplies `--target` and `--http2` from it unless you pass them.
+A target no send could reach (a scheme other than http/https/ws/wss, a port past 65535, a host
+with spaces in it) is refused at create, as MCP `create_repeater` refuses it. `--tags` is stored
+as MCP stores it (`#idor, x,,#IDOR` becomes `idor x`, and `#` stores nothing), and a blank
+`--name` leaves the tab `Untitled`.
 
 `--request-stdin` reads a pipe or a redirect (`--request-stdin < req.http`), and refuses a
 terminal. A terminal echoes every byte back (the whole raw request, `Cookie` and
@@ -542,6 +546,13 @@ backtrace, as the flag doors already did.
 ```bash
 id=$(gori run repeater create -t https://api.example.com -f req.http --format json | jq .id)
 gori run repeater send "$id"
+```
+
+**`repeater update <repeater-id>`**: edit a saved session in place, the headless MCP `update_repeater`. The id stays, so the retest steps and links that point at it keep working, which a delete and re-create would break. A flag left out keeps the stored value. `--target` (refused as on `create`), `-f`/`--request-file`, `-r`/`--request-raw` or `--request-stdin` (one at most, as on `create`), `--name` and `--tags` (`''` clears either), `--http2` / `--http1`, `--sni` (`''` clears it) and `--no-auto-cl` / `--auto-cl`. `--format json` prints the session as `repeater list --format json` does.
+
+```bash
+gori run repeater update 7 --target https://staging.example.com --tags "idor auth"
+generate-request | gori run repeater update 7 --request-stdin
 ```
 
 **`repeater send <repeater-id>`**: execute a saved session, HTTP or WebSocket.
@@ -604,7 +615,7 @@ gori run repeater move 5 --down
 
 **`repeater delete <repeater-id> [<repeater-id>…] --yes`**: close one or more saved sessions and renumber the strip. `--yes` is required, and every id is checked before the first delete, so one unknown id refuses the whole call, so a typo cannot half-empty the workbench. Each line names the tab number the session *had* (read once, before anything shifts); `--format json` returns `deleted` (with `was_tui_index`), `failed`, and `remaining`. A session that could not be removed leaves a non-zero exit.
 
-**`repeater race <repeater-id> <repeater-id> [<repeater-id>…]`**: fire several saved sessions as one synchronized race, so N distinct requests reach the server in one narrow window (a TOCTOU across different endpoints). Over HTTP/1.1 each request goes on its own connection and the last byte of every one is released together; over HTTP/2 they share one connection as a single-packet attack. Every session must resolve to one origin and share the transport, or the race is refused. `--http2` / `--http1` override the sessions' stored setting; `--max-requests=N` refuses a group larger than N rather than splitting it; `--verbatim`, `--slot=NAME`, `--reframe-grpc`, `--tls-preset=NAME`, `-k`, `--timeout`, `--allow-unscoped` and `--format text|json` behave as on `repeater send`. For many copies of *one* request, use `fuzz --race=N`.
+**`repeater race <repeater-id> <repeater-id> [<repeater-id>…]`**: fire several saved sessions as one synchronized race, so N distinct requests reach the server in one narrow window (a TOCTOU across different endpoints). Over HTTP/1.1 each request goes on its own connection and the last byte of every one is released together; over HTTP/2 they share one connection as a single-packet attack. Every session must resolve to one origin and share the transport, or the race is refused. `--http2` / `--http1` override the sessions' stored setting; `--max-requests=N` refuses a group larger than N rather than splitting it; `--verbatim`, `--slot=NAME`, `--reframe-grpc`, `--tls-preset=NAME`, `-k`, `--timeout`, `--allow-unscoped` and `--format text|json` behave as on `repeater send`. `--format json` is the object MCP `race_requests` returns: `responded` and `won_2xx` counts, and per member the session `id`, status, size, timing, response `head` and `body` in `repeater send`'s shape. A race is not stored, so this is the only copy of the bodies; `--max-body=BYTES` caps each one. For many copies of *one* request, use `fuzz --race=N`.
 
 ```bash
 gori run repeater race 3 4 --http2
