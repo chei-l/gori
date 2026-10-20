@@ -286,7 +286,7 @@ gori run history -q 'status:5xx' --limit 100 --format json
 | `--no-columns` | 이 프로젝트에 설정된 History 컬럼을 그리지 않습니다 |
 | `--format=FMT` | `text`, `json`(배열 하나), `jsonl`(한 줄에 객체 하나), 또는 `har` |
 | `--include-sensitive` | `Authorization` / `Cookie` / `Set-Cookie` / `Proxy-Authorization` / API 키 값을 `[REDACTED]` 대신 그대로 냅니다. `json`의 행별 `headers`와 `header:`/`cookie:` 컬럼에 적용됩니다. 다른 형식에서는 아무 효과가 없으며, 그 사실을 STDERR로 알립니다 |
-| `--redact [PROFILE]` | [리댁션 프로파일](#run-redact)로 요청/응답 **본문**을 정제한 뒤 씁니다. 본문을 싣는 목록 형식은 `--format har` 하나뿐이므로 그 형식에서만 동작하고, 나머지에서는 무시하지 않고 거부합니다 |
+| `--redact [PROFILE]` | [리댁션 프로파일](#run-redact)로 요청/응답 **본문**을 정제한 뒤 씁니다. 본문을 싣는 목록 형식은 `--format har`이고, 다른 형식에서는 `regex:`, `jsonpath:`, `position:` 컬럼만 본문을 읽으므로 그런 컬럼이 표시될 때만 동작하고 아니면 무시하지 않고 거부합니다. 이 컬럼들은 `show`처럼 프로젝트 기본 프로파일로도 정제된 본문을 읽고, `--no-redact`면 캡처된 본문을 읽습니다 |
 | `--no-redact` | 리댁션이 기본으로 설정돼 있어도 캡처한 본문을 그대로 씁니다 |
 | `--redact-preview` | `--redact`가 무엇을 바꿀지 값마다 한 줄씩 나열하고 HAR은 쓰지 않습니다 |
 
@@ -358,7 +358,7 @@ gori run compare 41 42 --pane response --changes-only
 |--------|-------------|
 | `--pane=PANE` | 비교 대상: `request` 또는 `response` (기본값) |
 | `--changes-only` | 변경되지 않은 문맥은 빼고 추가 / 삭제된 줄만 출력 |
-| `--context=N` | 변경 지점 주변 N줄만 남기고 나머지 동일 구간은 `@@ N unchanged lines @@` 마커로 접기 (`--changes-only`와 함께 쓸 수 없음) |
+| `--context=N` | 변경 지점 주변 N줄만 남기고 나머지 동일 구간은 `@@ N unchanged lines @@` 마커로 접기 (`--changes-only`와 함께 쓸 수 없음). 플래그가 없으면 접지 않고, 값 없는 `--context=`는 3줄을 남기며, diff 길이보다 큰 값은 아무것도 접지 않습니다 |
 | `--format=FMT` | `text` (기본값) 또는 `json` |
 | `--redact [PROFILE]`, `--no-redact`, `--redact-preview` | [`show`](#run-show)와 같음: 정제된 본문을 비교합니다. 바뀐 줄 수와 판정은 여전히 캡처된 바이트 기준입니다 |
 
