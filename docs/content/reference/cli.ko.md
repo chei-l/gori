@@ -632,7 +632,7 @@ gori run send --url https://api.example.com --request-file req.http --headers-on
 
 | Option | Description |
 | -------- | ------------- |
-| `--url=URL` (또는 URL을 유일한 인자로) | 절대 `http://` / `https://` URL. 경로와 쿼리가 request-target이 됩니다. 원시 요청과 함께 쓰면 접속할 곳만 정합니다 |
+| `--url=URL` (또는 URL을 유일한 인자로) | 절대 `http://` / `https://` URL. 경로와 쿼리가 request-target이 됩니다. 원시 요청과 함께 쓰면 접속할 곳만 정합니다. URL의 `user:pass@`는 curl처럼 Basic `Authorization`으로 보내며, `-H`로 준 것이 있으면 그쪽을 씁니다 |
 | `-X`, `--method=METHOD` | HTTP 메서드 (기본값 `GET`, 본문이 있으면 curl처럼 `POST`) |
 | `-H`, `--header=HEADER` | `Name: value`, 반복 가능, 쓴 순서대로 전송. `Host`와 `Content-Length`는 빠뜨렸을 때만 추가됩니다. 두 줄로 쪼개질 헤더나 토큰이 아닌 이름은 거부됩니다. 잘못된 바이트를 보내려면 원시 요청을 쓰세요 |
 | `-d`, `--data=DATA` (`--body`) | curl의 `-d`처럼 요청 본문: 반복하면 `&`로 이어 붙이고, `-H`가 지정하지 않으면 `Content-Type: application/x-www-form-urlencoded`를 추가합니다. `$ENV.KEY` 토큰이 확장됩니다 |
@@ -993,7 +993,7 @@ gori run import --postman api.postman_collection.json --db ./assessment.db --for
 
 임포트는 플로우를 기록하므로 `discover`와 같은 방식으로 대상을 정합니다. `--db`를 주면 생성하거나 다시 열고, 주지 않으면 기본 프로젝트를 몰래 만들지 않고 기존 프로젝트에 씁니다.
 
-형식이 잘못된 항목은 파일 전체를 중단시키지 않고 건너뛰며, 결과에 양쪽 개수가 모두 담깁니다(`{"count": 12, "attempted": 12, "skipped": 3}`). 프로젝트가 파싱한 플로우를 모두 커밋하지 못하면(저장소가 바쁘거나 쓸 수 없는 경우) `count`가 `attempted`보다 작아지고, text 줄에 커밋되지 않은 개수가 나오며, 명령은 `1`로 끝납니다. 임포트를 다시 실행하면 그 플로우를 재시도합니다. 응답까지 가져오는 것은 `--har`와 `--burp`뿐이고, 나머지는 요청 템플릿이라 보내기 전까지 History에서 `Pending`으로 보입니다.
+형식이 잘못된 항목은 파일 전체를 중단시키지 않고 건너뛰며, 결과에 양쪽 개수가 모두 담기고(`{"count": 12, "attempted": 12, "skipped": 3}`), `notes`가 건너뛴 줄이나 항목과 그 이유를 알려줍니다(처음 20개). 프로젝트가 파싱한 플로우를 모두 커밋하지 못하면(저장소가 바쁘거나 쓸 수 없는 경우) `count`가 `attempted`보다 작아지고, text 줄에 커밋되지 않은 개수가 나오며, 명령은 `1`로 끝납니다. 임포트를 다시 실행하면 그 플로우를 재시도합니다. 응답까지 가져오는 것은 `--har`와 `--burp`뿐이고, 나머지는 요청 템플릿이라 보내기 전까지 History에서 `Pending`으로 보입니다.
 
 ### run sitemap {#run-sitemap}
 
@@ -1048,7 +1048,7 @@ gori run sitemap export --in-scope --examples > api.json
 - **보안**: `Authorization` 헤더는 `http` bearer, basic, digest 스킴이 됩니다. 다른 자격 증명 헤더(`X-Api-Key`, `X-Auth-Token` 등)와 세션 쿠키는 `apiKey` 스킴이 됩니다. 값은 절대 쓰지 않습니다.
 - **건너뜀**: gori가 직접 보낸 요청(Repeater, Fuzzer, Miner, Discover 등. `--include-gori`를 주면 포함), WebSocket, gRPC, SSE, 응답이 완료되지 않은 플로우, 그리고 OpenAPI에 자리가 없는 메서드(CONNECT, WebDAV)는 건너뛰고 stderr에 개수를 적습니다. 첫 번째 규칙이 없으면 Discover 브루트포스가 추측한 경로가 모두 들어가고, 퍼징이 모든 타입을 느슨하게 만들어 버립니다.
 
-`-q`/`--query=QL`(위치 인자로도 가능), `--in-scope`, `--hide-static`은 `history`처럼 플로우 단위로 읽을 대상을 좁힙니다. `--host`는 정확한 호스트, `--path=PREFIX`는 경로 접두사입니다. 여러 호스트에 걸친 플로우는 문서 하나에 모든 origin을 `servers`로 적고, 경로마다 응답한 origin을 따로 적습니다. API 하나당 문서 하나가 필요하면 `--host`를 쓰세요. `--max-samples=N`(기본값 20)은 operation마다 읽을 플로우 수, `--max-flows=N`(기본값 5000)은 전체 플로우 수, `--max-endpoints=N`(기본값 1000)은 남길 operation 수의 상한입니다. 상한 때문에 문서가 잘리면 stderr에 알려줍니다.
+`-q`/`--query=QL`(위치 인자로도 가능), `--in-scope`, `--hide-static`은 `history`처럼 플로우 단위로 읽을 대상을 좁힙니다. `--host`는 정확한 호스트, `--path=PREFIX`는 경로 접두사입니다. 여러 origin에 걸친 플로우는 문서 하나에 모든 origin을 `servers`로 적고, 그중 일부만 응답한 경로에는 그 origin을 따로 적습니다. API 하나당 문서 하나가 필요하면 `--host`를 쓰세요. `--max-samples=N`(기본값 20)은 operation마다 읽을 플로우 수, `--max-flows=N`(기본값 5000)은 전체 플로우 수, `--max-endpoints=N`(기본값 1000)은 남길 operation 수의 상한입니다. 상한 때문에 문서가 잘리면 stderr에 알려줍니다.
 
 `--examples`를 주지 않으면 `example` 값은 없습니다. 예시 값은 샘플 하나에서 가져와 redaction 프로필(`--redact=PROFILE`, 기본값은 프로젝트 프로필, 없으면 전역 프로필, 없으면 `default`)을 거칩니다. 프로필의 필드 이름과 폼 키 이름은 쿼리 파라미터에도 적용됩니다. 자격 증명처럼 보이는 이름(`X-Access-Token`, `apiKey`, `userPassword`, `sig`)은 프로필과 상관없이 placeholder가 되고, 쿠키 값은 항상 placeholder입니다. 경로 id는 비밀을 뜻하지 않는 세그먼트 아래의 짧은 숫자나 날짜일 때만 예시를 붙이고, UUID·16진수·토큰 모양 세그먼트에는 붙이지 않습니다. 경로 속 자격 증명과 구별할 수 없기 때문입니다. 토큰 모양 경로 세그먼트(JWT, 긴 무작위 문자열)와 `;jsessionid=` 같은 matrix 파라미터는 경로 키에 들어가지 않습니다. 출력은 결정적이어서 같은 플로우를 두 번 내보내면 바이트가 같습니다. 그래서 두 문서의 `diff`가 곧 API의 변화입니다.
 

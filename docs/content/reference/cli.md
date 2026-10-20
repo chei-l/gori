@@ -640,7 +640,7 @@ gori run send --url https://api.example.com --request-file req.http --headers-on
 
 | Option | Description |
 | -------- | ------------- |
-| `--url=URL` (or the URL as the only argument) | Absolute `http://` / `https://` URL. Its path and query become the request-target; with a raw request it only names where to dial |
+| `--url=URL` (or the URL as the only argument) | Absolute `http://` / `https://` URL. Its path and query become the request-target; with a raw request it only names where to dial. A `user:pass@` in it is sent as Basic `Authorization`, as curl does, unless a `-H` gives one |
 | `-X`, `--method=METHOD` | HTTP method (default `GET`, or `POST` when there is a body, as curl) |
 | `-H`, `--header=HEADER` | `Name: value`, repeatable, sent in order. `Host` and `Content-Length` are added only when you leave them out. A header that would split into two lines, or a name that is not a token, is refused: a raw request is the form for malformed bytes |
 | `-d`, `--data=DATA` (`--body`) | Request body, as curl's `-d`: repeat to join with `&`; adds `Content-Type: application/x-www-form-urlencoded` unless a `-H` names one. `$ENV.KEY` tokens expand |
@@ -1001,7 +1001,7 @@ gori run import --postman api.postman_collection.json --db ./assessment.db --for
 
 Import writes flows, so it resolves its target like `discover`: an explicit `--db` is created or reopened, and without one it writes into an existing project rather than silently creating a default.
 
-A malformed entry is skipped rather than aborting the file; the result reports both counts (`{"count": 12, "attempted": 12, "skipped": 3}`). When the project cannot commit every parsed flow (a busy or unwritable store), `count` is smaller than `attempted`, the text line says how many did not commit, and the command exits `1`; re-run the import to retry them. Only `--har` and `--burp` carry responses; the rest import request templates that show as `Pending` in History until you send them.
+A malformed entry is skipped rather than aborting the file; the result reports both counts (`{"count": 12, "attempted": 12, "skipped": 3}`), and `notes` says which line or entry each skip was and why (the first 20). When the project cannot commit every parsed flow (a busy or unwritable store), `count` is smaller than `attempted`, the text line says how many did not commit, and the command exits `1`; re-run the import to retry them. Only `--har` and `--burp` carry responses; the rest import request templates that show as `Pending` in History until you send them.
 
 ### run sitemap
 
@@ -1056,7 +1056,7 @@ gori run sitemap export --in-scope --examples > api.json
 - **Security**: an `Authorization` header becomes an `http` bearer, basic or digest scheme. Another credential header (`X-Api-Key`, `X-Auth-Token`, …) and a session cookie become `apiKey` schemes. Their values are never written.
 - **Skipped**: requests gori sent itself (Repeater, Fuzzer, Miner, Discover and the other tools; `--include-gori` keeps them), WebSocket, gRPC, SSE and incomplete flows, and methods OpenAPI has no slot for (CONNECT, WebDAV). Each is counted on stderr. Without that first rule, a Discover brute force would add every path it guessed and a fuzz run would loosen every type.
 
-`-q`/`--query=QL` (also positional), `--in-scope` and `--hide-static` narrow the flows read, per flow as in `history`. `--host` is an exact host, and `--path=PREFIX` is a path prefix. When the flows span several hosts, one document lists every origin under `servers` and each path lists the ones that answered it; use `--host` for one API per document. `--max-samples=N` (default 20) caps the flows read per operation, `--max-flows=N` (default 5000) the flows read in all, and `--max-endpoints=N` (default 1000) the operations kept. A note on stderr says when a cap cut the document short.
+`-q`/`--query=QL` (also positional), `--in-scope` and `--hide-static` narrow the flows read, per flow as in `history`. `--host` is an exact host, and `--path=PREFIX` is a path prefix. When the flows span several origins, one document lists every origin under `servers` and a path answered by only some of them lists its own; use `--host` for one API per document. `--max-samples=N` (default 20) caps the flows read per operation, `--max-flows=N` (default 5000) the flows read in all, and `--max-endpoints=N` (default 1000) the operations kept. A note on stderr says when a cap cut the document short.
 
 There are no `example` values unless `--examples`. Examples come from one sample each and pass the redaction profile (`--redact=PROFILE`, by default the project's, else the global one, else `default`). The profile's field and form-key names apply to query parameters too. A name that reads as a credential (`X-Access-Token`, `apiKey`, `userPassword`, `sig`) is a placeholder whatever the profile says, and cookie values always are. A path id gets an example only when it is a short counter or a date under a segment that does not name a secret; a UUID, hex or token-shaped segment never does, because a credential in a path looks the same. Token-shaped path segments (a JWT, a long random string) and `;jsessionid=`-style matrix parameters never reach the path key. Output is deterministic: exporting the same flows twice gives the same bytes, so `diff` between two exports shows how the API changed.
 
