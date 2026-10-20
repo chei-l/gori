@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Send and WebSocket replay errors no longer carry a socket's heap address (`#<TCPSocket:0x…>`), so identical failures compare equal, and a connect failure through a host override names the address gori dialled and whose override it was, without suggesting DNS for an IP address, in the Repeater, `gori run`, MCP and the proxy's recorded error (#1695, #1696)
+- Repeater timing: a run whose sends failed says what they failed with, in its rationale and as `error` in `gori run repeater timing --format json` and MCP `timing_requests`, so a refused port, a timeout and a TLS failure read differently (#1679)
+- History: an errored flow's row carries its `error` in `gori run history --format json`, `gori run capture`'s JSON lines and MCP `list_history` (null on other rows) (#1680)
 - Import: every format says which line or entry it skipped and why (the first 20, in `notes`), the error for an import where nothing landed names the first reason, and a HAR handshake written with a `ws://` or `wss://` URL imports with its WebSocket messages (#1687, #1688)
 - `gori run send`, MCP `send_request{url}` and the request templates `gori run import` builds (`--urls`, `--oas`, `--postman`, `--insomnia`, `--wsdl`) send a URL's `user:pass@` as Basic `Authorization`, as curl does, unless a header gives one; a HAR keeps the headers it recorded (#1690)
 - Sitemap: OpenAPI export gives a path its own `servers` whenever the origins that answered it differ from the document's, so two origins of one host are no longer merged and `import --oas` puts each operation back on its own origin (#1675)
