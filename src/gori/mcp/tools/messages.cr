@@ -189,6 +189,31 @@ module Gori
         {page, fresh, since}
       end
 
+      # `operator_messages_page` plus the rows to hand over, held up to `wait_ms` while there
+      # are none. The operator writes from the TUI, another process: each slice reads the
+      # feed's high-water mark (one indexed MAX) and re-reads the page only once it moves.
+      private def operator_messages_wait(since : Int64, pid : Int64, limit : Int32, bare : Bool,
+                                         include_delivered : Bool, wait_ms : Int64) : {Store::MessagePage, Array(AgentMessage), Int64, Array(AgentMessage)}
+        read_on = bare && !include_delivered
+        # Read BEFORE the page, so a message written between the two still wakes the wait.
+        mark = store.last_event_id
+        page, fresh, read_since = operator_messages_page(since, pid, limit, read_on)
+        rows = include_delivered ? page.rows : fresh
+        # Only the feed's END is waited at: a full page with nothing to hand over (rows already
+        # carried, or another session's) answers at once with `has_more`, or the wait would
+        # re-read that same page until it ran out.
+        if rows.empty? && !page.full
+          long_poll(wait_ms) do
+            next false if (last = store.last_event_id) <= mark
+            mark = last
+            page, fresh, read_since = operator_messages_page(since, pid, limit, read_on)
+            rows = include_delivered ? page.rows : fresh
+            !rows.empty? || page.full
+          end
+        end
+        {page, fresh, read_since, rows}
+      end
+
       # #1090, layer three: what the operator said, read by the agent itself. Returns the
       # messages addressed to this session (or to all) after `since` that no live route has
       # already carried, and marks them delivered (`via: "poll"`) so the operator's ring can
@@ -211,8 +236,8 @@ module Gori
         # being handed over (and skips it entirely when the page is empty — the common "start
         # of turn, nothing new" case), and it is the same predicate the tool-result carry uses:
         # one answer to "has this session already had it", not two that can drift.
-        page, fresh, since = operator_messages_page(since, pid, limit, requested.nil? && !include_delivered)
-        rows = include_delivered ? page.rows : fresh
+        page, fresh, since, rows = operator_messages_wait(since, pid, limit, requested.nil?,
+          include_delivered, wait_ms_arg(h))
         can_mark = !store.read_only?
         label = session_label
         # Read BEFORE this call takes claims of its own: the oldest row somebody ELSE is still

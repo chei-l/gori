@@ -1699,6 +1699,42 @@ module Gori
         !!@cancelled.try(&.call)
       end
 
+      # The longest long-poll `wait_ms` (list_history, list_events, operator_messages, the job
+      # status tools): the server runs one call at a time, so a wait holds every other call
+      # behind it — the cap `ws_session_send{wait_ms}` takes, for the same reason.
+      LONG_POLL_MAX_WAIT_MS = 30_000_i64
+
+      # How often a long poll re-checks. Flows and operator messages are written by ANOTHER
+      # process (the TUI's proxy), so there is no in-process signal to wait on: each slice is
+      # one cheap indexed read, and the slice is also how soon a cancel is honoured.
+      LONG_POLL_SLICE = 100.milliseconds
+
+      private def wait_ms_arg(h) : Int64
+        optional_int_arg(h, "wait_ms").try(&.clamp(0_i64, LONG_POLL_MAX_WAIT_MS)) || 0_i64
+      end
+
+      # Sleep a slice, then ask the block; stop once it answers true, `wait_ms` has passed, or
+      # the client cancelled the call. Checks only AFTER a sleep, so a caller that just read an
+      # empty page does not read it again at once; `wait_ms` 0 returns without sleeping.
+      private def long_poll(wait_ms : Int64, & : -> Bool) : Nil
+        deadline = Time.instant + wait_ms.milliseconds
+        until cancelled?
+          left = deadline - Time.instant
+          break if left <= Time::Span.zero
+          sleep(left < LONG_POLL_SLICE ? left : LONG_POLL_SLICE)
+          break if yield
+        end
+      end
+
+      private def job_wait_prop : JSON::Any
+        intprop("hold up to N ms while running, max #{LONG_POLL_MAX_WAIT_MS}")
+      end
+
+      # A job status read with `wait_ms`: hold it while the job is still running.
+      private def wait_for_job(job : Job, h) : Nil
+        long_poll(wait_ms_arg(h)) { !job.live? } if job.live?
+      end
+
       # Whether this CALL (not just this tool) is an agent action worth recording. Most are a
       # flat name lookup, but two READ tools have a mode that is not: `probe_scan`'s active:true
       # SENDS real requests and persist:true WRITES findings, and `export_openapi`'s output_path
@@ -2400,6 +2436,12 @@ module Gori
         read_only = s.read_only?
         backlog = s.drain_fts!
         return nil if backlog.zero?
+        fts_backlog_error(backlog, read_only)
+      end
+
+      # The FTS_BACKLOG refusal itself, for `drain_fts_or_error` and a `list_history` wait that
+      # ran out with the index still partial.
+      private def fts_backlog_error(backlog : Int32, read_only : Bool) : Result
         if read_only
           err("#{backlog} flow(s) are not yet indexed for free-text search, and this server is " \
               "read-only (gori mcp --read-only) so it cannot index them — a body:/free-text " \

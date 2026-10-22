@@ -55,6 +55,13 @@ module Gori
           return err("pass only one of 'since' (tail newer, oldest-first) or 'before_id' (page older, newest-first)",
             "INVALID_ARGUMENT", field: "since")
         end
+        # A long poll needs a forward cursor: without `since` there is no "nothing new yet" to
+        # wait out. Refused rather than ignored, so a caller expecting a wait does not spin.
+        wait_ms = wait_ms_arg(h)
+        if wait_ms > 0 && since_id.nil?
+          return err("'wait_ms' waits for flows past 'since' — pass 'since'",
+            "INVALID_ARGUMENT", field: "wait_ms")
+        end
         # `count_only` answers with a number and no rows (#1648). Everything that shapes ROWS
         # contradicts it and is refused, not ignored, so the number never silently means
         # something other than "all flows the filters match". Above the FTS drain, as `ids` is.
@@ -159,25 +166,51 @@ module Gori
         # 50 rows as the whole story was reasoning about a truncated capture without knowing.
         # Fetching limit+1 makes the page state a FACT the reply carries.
         fetch = limit + 1
-        rows =
-          if scope_unconfigured
-            [] of Store::FlowRow
-          elsif (query && !query.strip.empty?) || in_scope || hide_static || view_filter != QL::EMPTY
-            # `view_filter` belongs in this condition and not only in the AND above: without it a
-            # `view` with no `query` and no `in_scope` falls through to `recent_flows`, which
-            # takes no filter at all — the call would accept the view and return everything.
-            # `hide_static` likewise.
-            #
-            # Raising, as the count does: a failed query degraded to `[]` with has_more:false,
-            # the reply for "nothing matched" (#1648 made the two paths disagree about one query).
-            begin
-              store.search(filter, fetch, before_id, since_id, raise_on_error: true, control: history_control)
-            rescue ex
-              return history_read_failed(ex, "list")
+        # `view_filter` belongs in this condition and not only in the AND above: without it a
+        # `view` with no `query` and no `in_scope` falls through to `recent_flows`, which
+        # takes no filter at all — the call would accept the view and return everything.
+        # `hide_static` likewise.
+        filtered = (query && !query.strip.empty?) || in_scope || hide_static || view_filter != QL::EMPTY
+        # Raising, as the count does: a failed query degraded to `[]` with has_more:false,
+        # the reply for "nothing matched" (#1648 made the two paths disagree about one query).
+        rows = begin
+          # Read BEFORE the page, so a flow committed between the two still wakes the wait.
+          mark = history_mark(filtered) if wait_ms > 0
+          page = history_rows(filter, filtered, scope_unconfigured, fetch, before_id, since_id)
+          # `wait_ms`: the flows are written by another process, so each slice reads the mark
+          # (indexed scalars) and re-runs the page only once it moves. A new flow the filter
+          # rejects moves it too, and the wait goes on. A filtered re-read can scan bodies
+          # over the whole tail, so under live capture it is TRIED at most once per
+          # HISTORY_REREAD_GAP — and so is the FTS drain a free-text filter needs first. Only a
+          # capturing TUI indexes in the background (`gori mcp`, `gori run` and a view-only TUI
+          # do not), so the wait drains itself; a write, so it is capped at one a second (P6).
+          # Rows still unindexed after it (a read-only server, a contended writer) are waited
+          # out: a page read past one could hand back a cursor beyond a match it omitted.
+          reread_at = Time.instant
+          if page.empty? && !scope_unconfigured
+            long_poll(wait_ms) do
+              next false if (now = history_mark(filtered)) == mark
+              next false if filtered && Time.instant < reread_at
+              reread_at = Time.instant + HISTORY_REREAD_GAP
+              if filter.uses_fts? && store.fts_dirty?
+                store.drain_fts!(LONG_POLL_SLICE) unless store.read_only?
+                next false if store.fts_dirty?
+              end
+              page = history_rows(filter, filtered, scope_unconfigured, fetch, before_id, since_id)
+              mark = now
+              !page.empty?
             end
-          else
-            store.recent_flows(fetch, before_id, since_id)
+            # Ran out empty with rows still unindexed: "no match" and "not indexed yet" would
+            # read the same, the ambiguity the drain above the page refuses (read-only, or a
+            # drain that kept losing the writer).
+            if wait_ms > 0 && page.empty? && filter.uses_fts? && store.fts_dirty?
+              return fts_backlog_error(store.fts_backlog, store.read_only?)
+            end
           end
+          page
+        rescue ex
+          return history_read_failed(ex, "list")
+        end
         has_more = rows.size > limit
         # `since` tails OLDEST-first, so the extra row is the NEWEST one — dropping from the
         # end is right in both directions, since each read returns its own order already.
@@ -211,6 +244,30 @@ module Gori
             j.field("flows") { raw_rows(j, parts) }
           end
         end)
+      end
+
+      # The least time between two filtered `list_history` re-reads while a wait is held.
+      HISTORY_REREAD_GAP = 1.second
+
+      # What a `list_history` wait watches: the flow id high-water mark, which every capture
+      # moves. A filtered tail also needs `data_version`, since a flow inserted at request
+      # time can start matching `status:`/`body:` only once its response is written (an
+      # update, which moves no id). ponytail: `data_version` is per pooled connection, so a
+      # read off another connection can cost a spare re-read of the tail, or miss one change
+      # until the next; a missed wake ends as the empty page, and the cursor keeps the row.
+      private def history_mark(filtered : Bool) : {Int64?, Int64}
+        {store.flow_id_high_water, filtered ? store.data_version : 0_i64}
+      end
+
+      private def history_rows(filter : QL::Filter, filtered : Bool, scope_unconfigured : Bool, fetch : Int32,
+                               before_id : Int64?, since_id : Int64?) : Array(Store::FlowRow)
+        if scope_unconfigured
+          [] of Store::FlowRow
+        elsif filtered
+          store.search(filter, fetch, before_id, since_id, raise_on_error: true, control: history_control)
+        else
+          store.recent_flows(fetch, before_id, since_id)
+        end
       end
 
       # The `count_only` path (#1648): the number of flows the compiled filter matches, from the
@@ -404,12 +461,15 @@ module Gori
         actor = closed_filter(h, "actor", EVENT_ACTORS)
         return actor if actor.is_a?(Result)
         kind = str(h, "kind")
-        scanned = store.events_after(since, limit)
-        next_cursor = scanned.empty? ? since : scanned.last.id
-        rows = scanned
-        rows = rows.select { |r| r.source == source } if source
-        rows = rows.select { |r| r.kind == kind } if kind && !kind.empty?
-        rows = rows.select { |r| r.actor == actor } if actor
+        rows, next_cursor, full = events_page(since, limit, source, kind, actor)
+        # `wait_ms`: re-read past the cursor each slice — a primary-key range read that finds
+        # nothing is the cheap check. Only the feed's END is waited at: a full page the filters
+        # emptied answers at once with its advanced cursor, or a stored match deep in a long
+        # feed would be reached one page per slice.
+        long_poll(wait_ms_arg(h)) do
+          rows, next_cursor, full = events_page(next_cursor, limit, source, kind, actor)
+          !rows.empty? || full
+        end if rows.empty? && !full
         # Under REPLY_ROWS_BUDGET (#1649): a cut page resumes after the last event it carried.
         parts = fit_rows(rows) { |rj, r, _| Serialize.event_row(rj, r) }
         cut = parts.size < rows.size
@@ -421,6 +481,19 @@ module Gori
             emit_cut(j, cut)
           end
         end)
+      end
+
+      # One `list_events` page past `since`: the rows the filters keep, the max id scanned, and
+      # whether the scan filled `limit` (more of the feed is stored past it).
+      private def events_page(since : Int64, limit : Int32, source : String?, kind : String?,
+                              actor : String?) : {Array(Store::EventRow), Int64, Bool}
+        scanned = store.events_after(since, limit)
+        next_cursor = scanned.empty? ? since : scanned.last.id
+        rows = scanned
+        rows = rows.select { |r| r.source == source } if source
+        rows = rows.select { |r| r.kind == kind } if kind && !kind.empty?
+        rows = rows.select { |r| r.actor == actor } if actor
+        {rows, next_cursor, scanned.size >= limit}
       end
 
       @[Tool("get_flow", requires: ["get_response_body_chunk"])]
@@ -829,6 +902,7 @@ module Gori
           s.field "limit", limitprop("max rows", HISTORY_LIMIT)
           s.field "before_id", intprop("cursor: page OLDER — only flows with id < this")
           s.field "since", intprop("cursor: tail NEWER — only flows with id > this, oldest-first; exclusive with before_id")
+          s.field "wait_ms", intprop("with since: wait up to this many ms for a new flow instead of an empty page (max #{LONG_POLL_MAX_WAIT_MS})")
           s.field "view", strprop("saved History view name (list_views), ANDed with `query`; unknown names are refused. Built-ins: #{SavedViews.builtin_names}")
           s.field "in_scope", boolprop("only flows in the configured scope (empty when none); QL `scope:in`/`scope:out` give finer control")
           s.field "hide_static", boolprop("omit static assets (images, fonts, audio/video; never svg/css/js or status >= 400); = QL `-static:true`")
@@ -850,6 +924,7 @@ module Gori
           s.field "source", enumprop("filter to one producer of feed rows", EVENT_SOURCES)
           s.field "actor", enumprop("filter to the surface that acted; background-engine rows name none", EVENT_ACTORS)
           s.field "kind", strprop("filter to one kind (e.g. job_done, agent_action, scope_add)")
+          s.field "wait_ms", intprop("wait up to this many ms for a matching event instead of an empty page (max #{LONG_POLL_MAX_WAIT_MS})")
         end
 
         tool j, "operator_messages",
@@ -861,6 +936,7 @@ module Gori
           s.field "since", intprop("feed cursor from the previous call (0 = from the start)")
           s.field "limit", limitprop("max messages to return", OPERATOR_MESSAGES_LIMIT)
           s.field "include_delivered", boolprop("also return messages a live route already carried")
+          s.field "wait_ms", intprop("wait up to this many ms for a message instead of an empty page (max #{LONG_POLL_MAX_WAIT_MS})")
         end
 
         if @allow_actions
