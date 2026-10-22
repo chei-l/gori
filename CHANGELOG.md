@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- MCP `get_response_body_chunk{find}` and `gori run show --find` locate a regex (matched as QL `body~`) inside one flow's body and return `{offset, length, snippet}` matches with `has_more`/`next_offset`, where each offset pages straight to its match (#1742)
 - Sitemap: MCP `list_sitemap` and `gori run sitemap` show which active tools have tested each endpoint, from their History-recorded flows and saved fuzz runs, as `touched_by`, and `untested:true` / `--untested` keeps only the endpoints with neither (#1741)
 - Redaction: a `jsonpath:`, `regex:` or `position:` column in `gori run history` reads the redaction profile's sanitized body, as `show` and MCP `list_history` do, and `--redact`/`--no-redact` apply to such a column on the text and json listings; a redacted HAR export sizes an intact body by its sanitized bytes, so it no longer gives away the secret's length or re-imports as truncated (#1671, #1672)
 - Compare: the TUI Comparer, `gori run compare` and MCP `compare_flows` tell apart messages that differ only in CRLF vs LF or where a CR sits, instead of calling them identical, and `gori run compare --context` with a huge value no longer crashes (#1674, #1691)
