@@ -262,6 +262,13 @@ describe Gori::Tui::Screen do
   # field's click-to-cursor goes through Screen.column_for, which floors each CODEPOINT to
   # ≥1. `parse_printable` accepts U+200B / U+FEFF / a combining mark unfiltered, and a URL
   # carrying a zero-width char is a stock filter-bypass payload — reachable input here.
+  it "never opens an input_line window on a combining mark" do
+    value = "ab" + "e\u0301" * 10 # ten é, each a base + combining acute
+    start = Screen.input_start(value, value.size, "", 6)
+    start.should be > 0
+    Screen.cluster_start(value, start).should eq(start)
+  end
+
   it "input_line uses the named badge width for the caret and click inverse" do
     value = "ab\u{200B}cd" # ZWSP at index 2 is drawn as a six-column badge
     (0..value.size).each do |cx|
@@ -277,6 +284,27 @@ describe Gori::Tui::Screen do
     end
     Screen.display_width(value[0, 3]).should eq(8)
     Screen.draw_width(value[0, 3]).should eq(8)
+  end
+
+  # The field never scrolled: a caret past the right edge drew no caret cell and set no
+  # cursor, so a long issue title or QL query was typed blind and an IME preedit vanished.
+  it "input_line scrolls a value wider than the field so the caret and cursor stay visible" do
+    value = "0123456789" * 3 # 30 chars into a 10-column field
+    b = MemoryBackend.new(40, 1)
+    screen = Screen.new(b)
+    start = screen.input_line(2, 0, value, value.size, "", Theme.text, width: 10)
+    start.should eq(21) # nine chars of tail + the caret cell
+    b.row(0)[2, 9].should eq("123456789")
+    b.bg_at(11, 0).should eq(Theme.accent) # caret on the field's last cell
+    screen.desired_cursor.should eq({11, 0})
+    Screen.input_click(value, start, 0).should eq(21) # a click rebases by the drawn window
+
+    # A preedit keeps its own cells AND the caret inside the field.
+    b2 = MemoryBackend.new(40, 1)
+    s2 = Screen.new(b2)
+    s2.input_line(0, 0, value, value.size, "가나", Theme.text, width: 10)
+    b2.row(0).should start_with("56789가") # a wide glyph's second cell reads as a blank
+    s2.desired_cursor.should eq({9, 0})
   end
 
   it "text draws a named tab badge in ASCII and mixed paths" do

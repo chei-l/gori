@@ -610,9 +610,12 @@ module Gori::Tui
             # A finished differential-timing run (#1246) opens its verdict card — but not over a
             # modal the operator raised meanwhile (the palette and a History detail are overlays
             # `active_overlay` does not return, and the space menu, pickers and bottom prompts are
-            # none); the report stays pending until the seam is clear.
+            # none), and not mid-typing: over a Repeater INSERT editor, Notes or a `/` bar the
+            # card swallowed the next keys, and a paste's tail. The report stays pending until
+            # the seam is clear.
             if @overlay.none? && !@space_menu_open && !copy_as_shown? && !send_to_shown? &&
                !@goto_open && !@search_open && !@rename_open && !@tag_edit_open &&
+               !text_input_active? && !@paste_newline.pasting? &&
                (rpt = repeater_controller.take_timing_report)
               open_overlay(TimingReportOverlay.new(rpt[0], rpt[1]))
               dirty = true
@@ -1401,6 +1404,11 @@ module Gori::Tui
     # A bracketed paste being DROPPED because its keystrokes would run as commands — see
     # `paste_runs_as_commands?`. Cleared at the paste's end marker.
     @paste_dropped = false
+    # The drop above began MID-paste (a modal held a key back, or a pasted ↵ committed a field):
+    # what came before it went in as typed. `@paste_cut_note` is the toast still owed, named on
+    # the first key the cut actually drops.
+    @paste_cut = false
+    @paste_cut_note = nil.as(String?)
     # Bounds a paste whose end marker never comes — the decision lives there, not here.
     @paste_stall = PasteStall.new
 
@@ -1455,9 +1463,10 @@ module Gori::Tui
       return !(was_pasting && @paste_newline.pasting?) if swallowed
       case ev
       when Termisu::Event::Key
-        return false if @paste_dropped
+        return false if drop_pasted_key?
         return false if buffer_bulk_paste(ev)
         handle_key(ev)
+        cut_paste_at_commands
       when Termisu::Event::Mouse
         # A click is not part of a paste, and acting on one mid-paste moves the target out from
         # under it: the tab/focus changes, and the buffered clipboard is then flushed into
@@ -2051,7 +2060,7 @@ module Gori::Tui
       # (`Overlay#takes_pasted?`). The refusal is named ONCE per paste, on the first key
       # held back, so a long clipboard does not toast a hundred times.
       if @paste_newline.pasting? && !ov.takes_pasted?(ev)
-        status(PASTE_MODAL_REFUSED) unless @toast == PASTE_MODAL_REFUSED
+        refuse_modal_paste(ev)
         return
       end
       case ov.handle_key(ev)
@@ -2072,7 +2081,19 @@ module Gori::Tui
     end
 
     # Shown when a pasted keystroke was held back from a modal (see `dispatch_overlay_key`).
+    # Latched: the rest of this paste is refused too. Letting the keys after the held-back one
+    # through glued the next line onto the first (`a.com⏎b.com` → `a.comb.com`) under a toast
+    # that said the paste had stopped.
+    private def refuse_modal_paste(ev : Termisu::Event::Key) : Nil
+      @paste_dropped = true
+      @paste_cut = true
+      key = ev.key
+      msg = key.enter? || key.tab? || key.back_tab? ? PASTE_MODAL_REFUSED : PASTE_MODAL_IGNORED
+      status(msg) unless @toast == msg
+    end
+
     PASTE_MODAL_REFUSED = "paste stopped at the line break — ↵ here means commit; press it yourself"
+    PASTE_MODAL_IGNORED = "paste ignored — this card answers keys you press, not a clipboard"
 
     private def dispatch_overlay_click(ov : Overlay, area : Rect, mx : Int32, my : Int32) : Nil
       apply_overlay_outcome(ov, ov.handle_click(area, mx, my))
@@ -5659,7 +5680,7 @@ module Gori::Tui
           FuzzSetOverlay.for_list
         end
       ov.on_commit = -> {
-        fuzzer_controller.apply_fuzz_set(ov.edit_index, ov.build_spec)
+        fuzzer_controller.apply_fuzz_set(v, ov.edit_index, ov.build_spec)
         true
       }
       open_overlay(ov)
@@ -5675,7 +5696,7 @@ module Gori::Tui
       return status("fuzz running — ^X to stop before editing Advanced", :busy) if v.running?
       ov = FuzzAdvancedOverlay.new(v.advanced_snapshot)
       ov.on_commit = -> {
-        fuzzer_controller.apply_fuzz_advanced(ov.snapshot)
+        fuzzer_controller.apply_fuzz_advanced(v, ov.snapshot)
         true
       }
       open_overlay(ov)

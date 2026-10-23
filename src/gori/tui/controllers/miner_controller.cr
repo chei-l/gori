@@ -528,12 +528,19 @@ module Gori::Tui
         # Cleared BEFORE the send, not only in the `ensure`: `events` is bounded and this send
         # blocks, so with the drain gone the `ensure` would be reached late or not at all — and
         # un-wedging the pane is the one thing that must not wait on a reader.
-        view.finish_run
-        # `ex.class` too: "Nil assertion failed" alone is what the operator gets in the job's
-        # error text, the notification AND the persisted event log, and it names nothing.
-        events.send({view, Miner::ErrorEvent.new("#{ex.class}: #{ex.message}")}) unless terminal_sent
+        # Not once a verdict is queued: the drain clears it, and a newer run may own the flag now.
+        unless terminal_sent
+          view.finish_run
+          # `ex.class` too: "Nil assertion failed" alone is what the operator gets in the job's
+          # error text, the notification AND the persisted event log, and it names nothing.
+          events.send({view, Miner::ErrorEvent.new("#{ex.class}: #{ex.message}")})
+        end
       ensure
-        view.finish_run # backstop — the drain's Done also clears it
+        # Backstop only when no verdict was queued: once Done/Error is on the channel the drain
+        # clears it, and by the time this fiber resumes from that blocking send the operator may
+        # have started a NEWER run on this view — clearing then unflagged a live mine (the
+        # Sequencer's #1429 sibling).
+        view.finish_run unless terminal_sent
       end
       # The request-time macro, when the run has one (#1350): said up front, because a per-request
       # macro serialises the mine and an operator otherwise learns that from the stopwatch.
