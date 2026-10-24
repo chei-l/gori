@@ -361,6 +361,8 @@ describe "WebSocket draft frames naming an unset $ENV var (#1666)" do
           JSON.parse(%({"repeater_id":#{rid},"messages":["u=$ENV.NOPE"],"allow_unscoped":true})))
         r.is_error.should be_true
         r.text.should contain("unresolved env $ENV.NOPE")
+        r.text.should contain("a WebSocket frame")
+        r.text.should contain("verbatim:true")
       end
     end
   end
@@ -388,6 +390,34 @@ describe "WebSocket draft frames naming an unset $ENV var (#1666)" do
         end
         expect_raises(Gori::Fuzz::PlanError, "unresolved env $ENV.NOPE") { build.call(false) }
         build.call(true).should be_a(Gori::Fuzz::Plan)
+      end
+    end
+  end
+
+  # A binary frame is bytes, never expanded on any WebSocket path; the fuzz plan used to expand it.
+  it "a fuzz sweep's BINARY frame is neither expanded nor refused" do
+    with_no_vars do
+      with_env_syntax(Gori::Env::Syntax::Namespaced) do
+        Gori::Settings.env_vars = [{"XV", "EXPANDED"}]
+        plan = Gori::Fuzz::Plan.build(Gori::Fuzz::PlanOptions.new(WS_UPGRADE,
+          default_target: "http://127.0.0.1:9",
+          sources: [Gori::Fuzz::InlineList.new(["a"])] of Gori::Fuzz::PayloadSource,
+          ws_messages: [Gori::Fuzz::WsMessageSource.new(2, "§x§ $ENV.XV $ENV.NOPE")]),
+          ungated_outbound)
+        String.new(plan.ws_script.not_nil!.render_spans(["a"]).frames.first.payload).should eq("a $ENV.XV $ENV.NOPE")
+      end
+    end
+  end
+
+  # `$GEN.TOTP` with no secret is refused in a request (#1591); a frame sent it as text.
+  it "MCP send_websocket refuses a $GEN token that cannot mint" do
+    with_env_store do |store|
+      with_env_syntax(Gori::Env::Syntax::Namespaced) do
+        rid = store.insert_repeater("ws://127.0.0.1:1", WS_UPGRADE.to_slice, false, true, nil, 0)
+        r = env_tools(store).call("send_websocket",
+          JSON.parse(%({"repeater_id":#{rid},"messages":["totp $GEN.TOTP"],"allow_unscoped":true})))
+        r.is_error.should be_true
+        r.text.should contain("$GEN.TOTP cannot mint")
       end
     end
   end

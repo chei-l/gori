@@ -244,10 +244,7 @@ module Gori
             end
             emit_cut(j, cut)
             emit_ignored_terms(j, dropped)
-            # The CLI's empty listing names this too; an empty page alone reads as "no such traffic".
-            if rows.empty? && (hint = query.try { |q| QL.missing_colon_hint(q) })
-              j.field "query_hint", hint
-            end
+            emit_query_hint(j, query) if rows.empty?
             j.field("flows") { raw_rows(j, parts) }
           end
         end)
@@ -294,8 +291,16 @@ module Gori
             j.field "scope_configured", false if scope_unconfigured
             j.field "limit_ignored", true if present?(h, "limit")
             emit_ignored_terms(j, ignored)
+            emit_query_hint(j, str(h, "query")) if count.zero?
           end
         end)
+      end
+
+      # The CLI's empty listing names this too; an empty answer alone reads as "no such traffic".
+      private def emit_query_hint(j : JSON::Builder, query : String?) : Nil
+        if hint = query.try { |q| QL.missing_colon_hint(q) }
+          j.field "query_hint", hint
+        end
       end
 
       # A History read that yields to the reader fiber and stops when the client cancels the
@@ -857,9 +862,16 @@ module Gori
         # flow_row is the row-only read; get_flow would materialize both BLOBs to answer
         # "does this exist?" — a 40 MB response would be read and discarded.
         return not_found("no flow with id #{id}") unless store.flow_row(id)
+        owners = store.link_owners(Store::LinkRefKind::Flow, id)
         return busy("flow NOT deleted (store busy or unwritable); it is unchanged") unless store.delete_flow(id)
         @body_chunk_memo = nil # correct either way (content-keyed); this just frees the buffer
-        Result.new({id: id, deleted: true}.to_json)
+        Result.new(JSON.build do |j|
+          j.object do
+            j.field "id", id
+            j.field "deleted", true
+            emit_unlinked(j, owners)
+          end
+        end)
       end
 
       # Wipe EVERY captured flow. The TUI puts a danger confirm in front of this; here

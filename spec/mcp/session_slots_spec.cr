@@ -70,6 +70,26 @@ describe "MCP session slots" do
     end
   end
 
+  # The baseline moves as a side effect of create/update/delete (`with_one_baseline`); the
+  # reply says so, and stays quiet when it did not move (a rename is not a move).
+  it "says when a write moved the Authorize baseline, and only then" do
+    with_store do |store|
+      t = tools_for(store)
+      first = call_json(t, "create_session_slot", %({"name":"admin"}))
+      first["baseline_slot"].as_s.should eq("admin")
+      first["baseline_note"].as_s.should contain(%(baseline is now "admin"))
+      call_json(t, "create_session_slot", %({"name":"user"}))["baseline_note"]?.should be_nil
+      call_json(t, "update_session_slot", %({"name":"admin","new_name":"root"}))["baseline_note"]?.should be_nil
+      took = call_json(t, "update_session_slot", %({"name":"user","baseline":true}))
+      took["baseline_slot"].as_s.should eq("user")
+      took["baseline_note"].as_s.should contain(%((was "root")))
+      gone = call_json(t, "delete_session_slot", %({"name":"user"}))
+      gone["baseline_slot"].as_s.should eq("root")
+      call_json(t, "delete_session_slot", %({"name":"root"}))["baseline_note"].as_s
+        .should contain("no slot holds the Authorize baseline")
+    end
+  end
+
   it "shows header values only under include_sensitive" do
     with_store do |store|
       t = tools_for(store)
@@ -195,6 +215,38 @@ describe "MCP set_active_session_slot" do
         Gori::Env.overlay_slot(wire).to_unsafe.should eq(wire.to_unsafe)
       ensure
         Gori::Env.layer = previous
+      end
+    end
+  end
+
+  # `gori run` prints `slot: sending as NAME`; an action reply names the same thing.
+  it "names the active slot on an action reply, and nothing with none active" do
+    server = TCPServer.new("127.0.0.1", 0)
+    spawn do
+      while conn = server.accept?
+        Gori::Proxy::Codec::Http1.read_head(conn) rescue nil
+        conn << "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" rescue nil
+        conn.close rescue nil
+      end
+    end
+    send = %({"url":"http://127.0.0.1:#{server.local_address.port}/","allow_unscoped":true,"record_history":false})
+    with_store do |store|
+      previous = Gori::Env.layer
+      begin
+        t = tools_for(store)
+        call_json(t, "send_request", send)["session_slot"]?.should be_nil
+        call_json(t, "create_session_slot", %({"name":"admin","set_headers":["X-Who: admin"]}))
+        call_json(t, "set_active_session_slot", %({"name":"admin"}))
+        call_json(t, "send_request", send)["session_slot"].as_s.should eq("admin")
+        # A field-native send takes no overlay, so it must not claim the identity.
+        fields = %({"url":"http://127.0.0.1:#{server.local_address.port}/","allow_unscoped":true,"record_history":false,) +
+                 %("http2":true,"h2_fields":[[":method","GET"],[":path","/"],[":scheme","http"],[":authority","x"]]})
+        reply = JSON.parse(t.call("send_request", JSON.parse(fields)).text)
+        reply["scope_decision"]?.should_not be_nil # the send reply itself, not an early refusal
+        reply["session_slot"]?.should be_nil
+      ensure
+        Gori::Env.layer = previous
+        server.close
       end
     end
   end

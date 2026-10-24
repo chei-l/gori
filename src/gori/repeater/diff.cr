@@ -73,6 +73,8 @@ module Gori
       end
 
       def self.lines(a : Array(String), b : Array(String)) : Array(DiffLine)
+        full_a = a
+        full_b = b
         a = a.first(MAX_LINES)
         b = b.first(MAX_LINES)
         m = a.size
@@ -100,7 +102,22 @@ module Gori
         p.times { |k| acc << DiffLine.new(DiffKind::Same, a[k]) }
         emit_middle(acc, a, b, aid, bid, p, m - p - s, n - p - s)
         s.times { |k| acc << DiffLine.new(DiffKind::Same, a[m - s + k]) }
-        acc
+        drop_cut_tail(acc, full_a, full_b)
+      end
+
+      # Past the last Same row, a Del whose twin sits just past b's CUT (one inserted line shifts
+      # the window) is not a deletion, and diffing the two windows as complete invented it as one.
+      # The same for an Add and a's cut. Dropped only when that twin is really there: a tail row
+      # with no twin is a real change, and dropping every one hid a body that differed throughout.
+      # A shift wide enough to push a twin out is at most the tail's length, so that bounds the look.
+      private def self.drop_cut_tail(acc : Array(DiffLine), a : Array(String), b : Array(String)) : Array(DiffLine)
+        return acc unless truncated?(a, b)
+        last_same = acc.rindex(&.kind.same?) || -1
+        tail = acc[(last_same + 1)..]
+        past_a = (a[MAX_LINES, tail.size]? || [] of String).to_set
+        past_b = (b[MAX_LINES, tail.size]? || [] of String).to_set
+        kept = tail.reject { |dl| (dl.kind.del? && past_b.includes?(dl.text)) || (dl.kind.add? && past_a.includes?(dl.text)) }
+        acc[0, last_same + 1] + kept
       end
 
       # Diff the changed middle a[p, mm] vs b[p, nn] (the prefix/suffix already peeled),

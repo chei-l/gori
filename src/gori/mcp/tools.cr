@@ -1250,6 +1250,8 @@ module Gori
         # not reach. See `Authorize::Target#unanswered?`.
         property unanswered = 0
         property unanswered_reason : String? = nil
+        # The `unanswered` requests whose baseline DID answer (`Target#baseline_only_answered?`).
+        property baseline_only_answered = 0
         # Requests whose BASELINE was itself refused (4xx/5xx). Nothing on such a request can
         # be judged — `Judge.verdict` demotes every comparison against a denied baseline to
         # `review` — so these contribute to neither count below, and a job made only of them
@@ -1384,6 +1386,45 @@ module Gori
         "minimize_repeater"    => {"id" => "repeater_id"},
         "intercept_toggle"     => {"enabled" => "enable"},
       }
+
+      # Each `update_*` tool's SELECTOR arguments: the ones that pick the row rather than change
+      # it. A call that gives nothing else is refused by `nothing_to_change` before dispatch.
+      # The tools used to disagree on that call — some refused, update_rule/update_extract_rule
+      # rewrote the row and answered `updated:true`, others answered ok — and `gori run
+      # repeater update` refuses it. A guard spec holds every advertised `update_*` tool to an
+      # entry here.
+      UPDATE_SELECTORS = {
+        "update_color_rule"    => {"id", "scope"},
+        "update_custom_color"  => {"name"},
+        "update_extract_rule"  => {"id"},
+        "update_host_override" => {"id"},
+        "update_issue"         => {"id"},
+        "update_note"          => {"id"},
+        "update_oast_provider" => {"id"},
+        "update_probe_rule"    => {"id"},
+        "update_repeater"      => {"id"},
+        "update_repeaters"     => {"ids"},
+        "update_retest_step"   => {"id"},
+        "update_rule"          => {"id", "scope"},
+        "update_scope_rule"    => {"id"},
+        "update_session_slot"  => {"name"},
+        "update_view"          => {"name", "scope"},
+      }
+
+      # The refusal for an `update_*` call that names only its row, or nil. Run on the
+      # alias-folded arguments. Any other key counts as a change, JSON null included: on
+      # update_issue `flow_id: null` clears the link, so null is not "absent" here.
+      private def nothing_to_change(name : String, h : Hash(String, JSON::Any)) : Result?
+        return nil unless selectors = UPDATE_SELECTORS[name]?
+        # No row named at all is the handler's "missing required" refusal, not this one.
+        return nil unless h.has_key?(selectors.first)
+        return nil if h.each_key.any? { |k| !selectors.includes?(k) && !k.starts_with?('_') }
+        aliases = ARG_ALIASES[name]?
+        declared = declared_args[name]? || return nil
+        fields = declared.reject { |k| selectors.includes?(k) || aliases.try(&.has_key?(k)) }
+        # "the fields it takes", not "at least one of": update_host_override needs host AND ip.
+        err("nothing to change — this call names only its row; the fields it takes: #{fields.join(", ")}", "INVALID_ARGUMENT")
+      end
 
       # Fold each alias the call used into its real name, or the refusal for a call that spelled
       # both with different values. A JSON null is absent, as everywhere else here; equal values
@@ -1625,6 +1666,9 @@ module Gori
         h = resolved
         if missing = missing_aliased(name, h)
           return missing
+        end
+        if unchanged = nothing_to_change(name, h)
+          return unchanged
         end
         # After every argument check, so a call that could never run puts no card in front of
         # the operator, and on the arguments as they will run.
@@ -2422,11 +2466,17 @@ module Gori
       end
 
       # Emits scope_decision / matched scope_rule_id / effective_host onto an
-      # active tool's result object so the send's scope evidence is self-contained.
-      private def emit_scope(j : JSON::Builder, sc : ScopeCheck) : Nil
+      # active tool's result object so the send's scope evidence is self-contained — and the
+      # active `session_slot` it went out as, the line `gori run` prints as `slot: sending as NAME`.
+      # (authorize_start does not call this: an Authorize run wears no active slot.)
+      # `slot: false` for a send that never takes the active slot's overlay (`grpc_reflect`'s
+      # client, a field-native `h2_fields` send): naming an identity the request did not carry is
+      # the wrong way for this to be wrong.
+      private def emit_scope(j : JSON::Builder, sc : ScopeCheck, slot : Bool = true) : Nil
         j.field "scope_decision", sc.decision
         j.field "scope_rule_id", sc.rule_id if sc.rule_id
         j.field "effective_host", Serialize.text(sc.host)
+        Env.active_slot_name.try { |name| j.field "session_slot", Serialize.text(name) } if slot
       end
 
       # A string-shaped argument, held to the same "lenient, but never SILENT" contract every

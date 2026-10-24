@@ -494,10 +494,12 @@ module Gori::Fuzz
       # frame the operator typed (`--message`, MCP `messages`) resolves its `$KEY`, a CAPTURED
       # frame does not. `Env.expand`, not `expand_wire` — a frame has no head, so there is no
       # LF→CRLF promotion to make and nothing in it is a message boundary.
-      # A typed frame takes the head's #1666 refusal too.
+      # A typed frame takes the head's #1666 refusal too. A BINARY frame takes no `$ENV` pass, as
+      # on the Repeater's frame paths (`send_websocket`, `gori run repeater send`, the TUI); the send
+      # seam's binding pass is a separate step and still sees it.
       ws_texts = options.ws_messages.try(&.map do |m|
-        next m.payload if m.evidence || options.verbatim?
-        if m.opcode == Proxy::WS::OP_TEXT.to_i && (detail = Env.unresolved_env(m.payload))
+        next m.payload if m.evidence || options.verbatim? || m.opcode != Proxy::WS::OP_TEXT.to_i
+        if detail = Env.unresolved_env(m.payload)
           raise PlanError.new(PlanError::Reason::UnresolvedEnv, "unresolved env #{detail}", detail)
         end
         Env.expand(m.payload)
@@ -516,7 +518,8 @@ module Gori::Fuzz
       end
 
       shadowed_marks = [] of String
-      mark_matches = options.marks.map do |tok|
+      # Once per token: a repeat was reported both shadowed (by its first copy) and matched.
+      mark_matches = options.marks.uniq.map do |tok|
         text, count, shadowed = wrap_token(text, tok)
         # Across EVERY part. A `--mark` aimed at a value that lives in a frame would otherwise
         # report `{token, 0}` and mark nothing, while the operator watched the flag they typed
@@ -799,7 +802,7 @@ module Gori::Fuzz
       end
       if options.config.race_count
         raise GrpcFieldError.new(
-          "a gRPC field position and --race cannot combine: a race group is N byte-identical " \
+          "a gRPC field position and a race (`race_count`/`--race`) cannot combine: a race group is N byte-identical " \
           "copies of ONE request released together, which bypasses payload substitution " \
           "entirely — there is nothing for a field position to substitute into")
       end
@@ -852,13 +855,13 @@ module Gori::Fuzz
       # construction (`http2 = force_h2 || seed.http2`), which is why the test is on the
       # handshake shape and not on the flag alone.
       if options.http2? && !extended
-        raise WsError.new("--http2 and an `Upgrade: websocket` script cannot combine: HTTP/2 has no " \
+        raise WsError.new("HTTP/2 (`http2`/`--http2`) and an `Upgrade: websocket` script cannot combine: HTTP/2 has no " \
                           "upgrade mechanism (RFC 9113 §8.1), so a WebSocket over h2 is opened by an " \
                           "RFC 8441 extended CONNECT instead — which this template is not. Sweep it over " \
                           "HTTP/1.1, or drop the frames to sweep the handshake itself as an h2 request")
       end
       if options.config.race_count
-        raise WsError.new("--race and a WebSocket script cannot combine: a race group is N byte-identical " \
+        raise WsError.new("a race (`race_count`/`--race`) and a WebSocket script cannot combine: a race group is N byte-identical " \
                           "copies of ONE request released together, which bypasses payload substitution " \
                           "entirely and has no framed-exchange form. Drop the frames to race the handshake")
       end
@@ -951,9 +954,10 @@ module Gori::Fuzz
       return unless race_count
       return unless config.stop_after_matches || matcher.stop_condition
       raise Gori::Error.new(
-        "stop_on cannot combine with --race: a race group is N byte-identical copies of ONE " \
-        "request released together in a single write, so there is no per-response verdict for a " \
-        "stop condition or a match count to fire on. Drop --race, or drop the stop condition")
+        "a stop condition (`stop_on`/`--stop-on`) cannot combine with a race (`race_count`/`--race`): " \
+        "a race group is N byte-identical copies of ONE request released together in a single " \
+        "write, so there is no per-response verdict for a stop condition or a match count to fire " \
+        "on. Drop the race, or drop the stop condition")
     end
 
     private def self.validate_tls_preset(name : String?) : String?

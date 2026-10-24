@@ -147,7 +147,8 @@ module Gori
         # sentence with the three `gori run` surfaces (`CLI::Run.unbound_overlay_note`).
         unbound_overlay = CLI::Run.unbound_overlay_note(Env.take_unbound_overlay)
         flow_response_saved = recorded_flow_id ? record_outbound_response(recorded_flow_id, result) : false
-        write_back_repeater_response(h, result, applied_rules, sent_row_digest)
+        per_send_edit = per_send_edit(h, applied_rules)
+        write_back_repeater_response(h, result, per_send_edit, sent_row_digest)
         # Audit trail on STDERR — never STDOUT (reserved for JSON-RPC).
         Log.info { "send_request #{built.scheme}://#{built.host}:#{built.port} http2=#{http2} scope=#{sc.decision} flow_id=#{recorded_flow_id || "none"} -> #{result.ok? ? "ok" : result.error}" }
 
@@ -183,7 +184,7 @@ module Gori
           # report a handshake that did not happen.
           tls_preset: plan.scheme == "https" ? plan.tls_preset : nil,
           body_more: body_more, via: Proxy::Upstream.via(plan.host, plan.scheme, plan.port),
-          rules_kept_repeater: applied_rules && result.ok? ? int(h, "repeater_id") : nil,
+          kept_repeater: per_send_edit && result.ok? ? int(h, "repeater_id").try { |rid| {rid, per_send_edit} } : nil,
           freeze_ref: if repeater_id && repeater_response_saved
             %(ref_kind:"repeater" ref_id:#{repeater_id})
           elsif recorded_flow_id && flow_response_saved
@@ -831,6 +832,12 @@ module Gori
         false
       end
 
+      # What made this send's bytes differ from the saved row, or nil (the CLI's `per_send_edits`).
+      private def per_send_edit(h, applied_rules : Bool) : String?
+        return "Match & Replace rewrote this send" if applied_rules
+        "grpc_fields edited this send" unless str_list(h, "grpc_fields").empty?
+      end
+
       # A `repeater_id` send's answer, written back onto the session it ran — what the TUI's
       # send and `gori run repeater send` both do, and what the tab's response pane and the next
       # `repeater send --diff` read as "the last response". Without it an MCP send left the
@@ -840,10 +847,10 @@ module Gori
       # stored response), digested over the ROW's request as read before the send (the drift
       # check compares the row, not the wire, so `$NAME` expansion and the slot overlay do not
       # count), and not when this send's bytes differ from the row's by more than that —
-      # `apply_rules` rewrote them.
-      private def write_back_repeater_response(h, result : Repeater::Result, applied_rules : Bool,
+      # `per_send_edit` names what changed them (`apply_rules`, `grpc_fields`).
+      private def write_back_repeater_response(h, result : Repeater::Result, per_send_edit : String?,
                                                digest : String?) : Nil
-        return unless result.ok? && !applied_rules && digest
+        return unless result.ok? && per_send_edit.nil? && digest
         return unless id = int(h, "repeater_id")
         return if store.update_repeater_response(id, result.head, result.body, result.error,
                     result.duration_us, request_sha256: digest)
@@ -1019,11 +1026,11 @@ module Gori
                                    unbound_overlay : String? = nil,
                                    head_unterminated : Bool = false,
                                    tls_preset : String? = nil, body_more : String? = nil,
-                                   via : String? = nil, rules_kept_repeater : Int64? = nil,
+                                   via : String? = nil, kept_repeater : {Int64, String}? = nil,
                                    freeze_ref : String? = nil) : String
         JSON.build do |j|
           j.object do
-            emit_scope(j, sc)
+            emit_scope(j, sc, slot: h2_fields.nil?)
             # The egress this send took — upstream proxy, environment proxy or direct, and the
             # setting that chose it (`Proxy::Upstream.via`, `gori run send`'s `via:`, #1625).
             j.field "via", via if via
@@ -1039,15 +1046,16 @@ module Gori
             # mentioned it. gori still SENT it — see `CLI::Run.unterminated_head_note`.
             emit_head_unterminated(j, head_unterminated)
             j.field "match_replace_applied", true if applied_rules
-            # `write_back_repeater_response` keeps the tab's old answer when rules rewrote the
-            # send, and said nothing — so the next `freeze_evidence` on the tab froze a response
-            # this send never got, under a request it never sent.
-            if id = rules_kept_repeater
+            # `write_back_repeater_response` keeps the tab's old answer when this send's bytes
+            # differ from its row, and said nothing — so the next `freeze_evidence` on the tab
+            # froze a response this send never got, under a request it never sent.
+            if kept = kept_repeater
+              id, why = kept
               j.field "repeater_response_written", false
               j.field "repeater_response_note",
-                "Match & Replace rewrote this send, so repeater ##{id} keeps its PREVIOUS response; " \
+                "#{why}, so repeater ##{id} keeps its PREVIOUS response; " \
                 "freeze_evidence on the repeater freezes that older exchange, not this one — " +
-                (freeze_ref ? "freeze #{freeze_ref} instead" : "re-send with record_history to freeze this one")
+                (freeze_ref ? "freeze #{freeze_ref} instead" : "re-send with record_history or save_as_repeater to freeze this one")
             end
             # Beside `effective_request`, which is where the literal `$NAME` is visible in the
             # bytes — an agent that reads the response alone cannot tell this send from one
@@ -1333,14 +1341,20 @@ module Gori
       # The frames to hand the engine: TEXT payloads take `Env.expand` unless `literal`, refusing an
       # `$ENV.X` with no value as `send_request` does (#1666) rather than framing it literally.
       # `evidence` marks captured bytes, which the send seam's binding pass leaves alone.
+      # `escape` is the caller's way to send a frame as written: `send_websocket` takes `verbatim`
+      # per call, a live session only when it is opened.
       private def ws_out_msgs(source : Array(Store::WsOutMessage), literal : Bool,
-                              evidence : Bool = false) : Array(Repeater::WsEngine::OutMsg) | Result
+                              evidence : Bool = false,
+                              escape : String = "verbatim:true sends the frames and handshake as written") : Array(Repeater::WsEngine::OutMsg) | Result
         source.map do |m|
           payload = m.text? && !literal ? Repeater::UrlRequest.expand(String.new(m.payload)).to_slice : m.payload
           Repeater::WsEngine::OutMsg.new(m.opcode, payload, m.shape, evidence)
         end
       rescue ex : Repeater::PlanError
-        send_plan_error(ex, "messages")
+        # Which bytes named it: only frames reach here (the handshake is its plan's to refuse) —
+        # the call's `messages`, or the session's stored ones when none was given.
+        err("a WebSocket frame: #{send_plan_message(ex)}; #{escape}",
+          "INVALID_ARGUMENT", field: "messages")
       end
 
       # The repeater's handshake as a plan, through Layer 1 (scope) and Layer 2 (sandbox), or
@@ -1437,21 +1451,23 @@ module Gori
       # MCP's wording for a builder refusal. Exhaustive on `Reason` so a new builder failure
       # reaches the agent as a coded INVALID_ARGUMENT rather than a bare exception string.
       private def send_plan_error(ex : Repeater::PlanError, field : String) : Result
+        err(send_plan_message(ex), "INVALID_ARGUMENT", field: field)
+      end
+
+      private def send_plan_message(ex : Repeater::PlanError) : String
         detail = ex.detail
-        message =
-          case ex.reason
-          in Repeater::PlanError::Reason::NoRequest         then "the request is empty"
-          in Repeater::PlanError::Reason::NoTarget          then "'url' is required"
-          in Repeater::PlanError::Reason::BadTarget         then "could not parse a target host from #{detail.inspect}"
-          in Repeater::PlanError::Reason::UnsupportedScheme then "unsupported scheme: #{detail} (only http/https)"
-          in Repeater::PlanError::Reason::UnresolvedEnv
-            # The operator is named first: a second-factor secret is better set in gori than
-            # handed to an agent, and a global env var stays out of project exports.
-            ex.mint_refusal.try { |note| "#{note} — ask the operator to set it (a global env var stays out of project exports), or set it with set_env_var, or remove the token" } ||
-              env_unresolved_error(detail)
-          in Repeater::PlanError::Reason::TlsPreset then ex.message || "unknown tls_preset"
-          end
-        err(message, "INVALID_ARGUMENT", field: field)
+        case ex.reason
+        in Repeater::PlanError::Reason::NoRequest         then "the request is empty"
+        in Repeater::PlanError::Reason::NoTarget          then "'url' is required"
+        in Repeater::PlanError::Reason::BadTarget         then "could not parse a target host from #{detail.inspect}"
+        in Repeater::PlanError::Reason::UnsupportedScheme then "unsupported scheme: #{detail} (only http/https)"
+        in Repeater::PlanError::Reason::UnresolvedEnv
+          # The operator is named first: a second-factor secret is better set in gori than
+          # handed to an agent, and a global env var stays out of project exports.
+          ex.mint_refusal.try { |note| "#{note} — ask the operator to set it (a global env var stays out of project exports), or set it with set_env_var, or remove the token" } ||
+            env_unresolved_error(detail)
+        in Repeater::PlanError::Reason::TlsPreset then ex.message || "unknown tls_preset"
+        end
       end
 
       # Either replays a persisted repeater (repeater_id), repeaters a captured flow
