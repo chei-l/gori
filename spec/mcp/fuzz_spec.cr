@@ -1,4 +1,5 @@
 require "../spec_helper"
+require "../support/mcp_harness"
 require "socket"
 require "base64"
 require "compress/gzip"
@@ -1527,6 +1528,24 @@ describe "MCP fuzz_start — a 'marks' token that made no position" do
       landed["marks_warning"]?.should be_nil
     end
   end
+
+  it "names a mark that is not in the request, and one that sweeps several spots" do
+    with_store do |store|
+      tools = tools_for(store)
+      base = {"url" => "http://127.0.0.1:9/", "payloads" => %([{"list":["a"]}]),
+              "allow_unscoped" => true, "record_history" => false,
+              "template" => "GET /p?a=1&b=2 HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n"}
+      warned = call_json(tools, "fuzz_start", base.merge({"marks" => ["zzz", "b=2"]}).to_json)["marks_warning"].as_s
+      warned.should contain(%("zzz": not found in the request))
+      warned.should_not contain(%("b=2"))
+      call_json(tools, "fuzz_start", base.merge({"marks" => ["1"]}).to_json)["marks_warning"].as_s
+        .should contain(%("1" matches))
+
+      text, is_error = call_raw(tools, "fuzz_start", base.merge({"marks" => ["zzz"]}).to_json)
+      is_error.should be_true
+      text.should contain(%(none of 'marks' occurs in the request ("zzz")))
+    end
+  end
 end
 
 # A row an agent can never see is a row that did not happen.
@@ -1862,5 +1881,33 @@ describe "MCP fuzz_start extractors (#1592)" do
       end
       store.fuzz_runs.should be_empty
     end
+  end
+end
+
+# The client going away (EOF on stdin) ends the process. A `save_results` run still in flight
+# used to stay `running` in the project forever, with `sent` never written.
+describe "MCP fuzz_start{save_results} when the client disconnects" do
+  it "closes the saved run as stopped" do
+    origin = TCPServer.new("127.0.0.1", 0)
+    port = origin.local_address.port
+    spawn do
+      while conn = origin.accept?
+        Gori::Proxy::Codec::Http1.read_head(conn)
+        sleep 2.seconds # never answers within the run's timeout
+        conn.close
+      end
+    end
+    with_store do |store|
+      call = {"jsonrpc" => "2.0", "id" => 1, "method" => "tools/call", "params" => {
+        "name" => "fuzz_start", "arguments" => {
+          "template" => "GET /?q=§x§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", "url" => "http://127.0.0.1:#{port}",
+          "payloads" => [{"list" => ["a", "b", "c"]}], "concurrency" => 1, "timeout_ms" => 500,
+          "save_results" => true, "allow_unscoped" => true,
+        },
+      }}.to_json
+      mcp_tool_payload(mcp_drive(store, call, verify_upstream: false)[0])["job_id"].as_s.should_not be_empty
+      store.fuzz_runs.first.status.should eq("stopped")
+    end
+    origin.close
   end
 end

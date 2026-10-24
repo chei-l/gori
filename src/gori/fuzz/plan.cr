@@ -301,6 +301,12 @@ module Gori::Fuzz
     # Reported here for the same reason `rewrites_content_length?` is: a fact about the run
     # that only the builder can see, said ONCE, up front, by whichever surface asked.
     getter shadowed_marks : Array(String)
+
+    # The marks that do not occur in the request at all: `{token, 0}` minus `shadowed_marks`.
+    def missing_marks : Array(String)
+      mark_matches.compact_map { |(tok, n)| tok if n.zero? && !shadowed_marks.includes?(tok) }
+    end
+
     # How many payload sets this run was given but will never draw from — the count, not the
     # sets, because the operator identifies them by the ORDER they typed them in.
     #
@@ -488,7 +494,14 @@ module Gori::Fuzz
       # frame the operator typed (`--message`, MCP `messages`) resolves its `$KEY`, a CAPTURED
       # frame does not. `Env.expand`, not `expand_wire` — a frame has no head, so there is no
       # LF→CRLF promotion to make and nothing in it is a message boundary.
-      ws_texts = options.ws_messages.try(&.map { |m| m.evidence || options.verbatim? ? m.payload : Env.expand(m.payload) })
+      # A typed frame takes the head's #1666 refusal too.
+      ws_texts = options.ws_messages.try(&.map do |m|
+        next m.payload if m.evidence || options.verbatim?
+        if m.opcode == Proxy::WS::OP_TEXT.to_i && (detail = Env.unresolved_env(m.payload))
+          raise PlanError.new(PlanError::Reason::UnresolvedEnv, "unresolved env #{detail}", detail)
+        end
+        Env.expand(m.payload)
+      end)
 
       if options.auto_mark?
         text = Template.auto_mark(text)
@@ -568,7 +581,11 @@ module Gori::Fuzz
       # `Config#race_count` — so it has no use for §…§ positions or payload sets at all, and
       # both guards below (and NoPayloads, one screen down) are skipped when it is set.
       # (`race_count` is validated above, ahead of the gRPC field guard — see there.)
-      raise PlanError.new(PlanError::Reason::NoPositions, "the template has no §…§ positions") if marked.position_count == 0 && !race_count
+      # `detail` = the marks that occur nowhere, comma-joined, so the refusal can name them.
+      if marked.position_count == 0 && !race_count
+        missing = mark_matches.compact_map { |(tok, n)| tok.inspect if n.zero? && !shadowed_marks.includes?(tok) }
+        raise PlanError.new(PlanError::Reason::NoPositions, "the template has no §…§ positions", missing.join(", ").presence)
+      end
       # The twin of the target's unresolved-token refusal (`resolve_origin`, below), for the same
       # reason: a `¦chain` this run cannot apply leaves the position's payload UNTRANSFORMED on
       # the wire. See `refuse_unrunnable_chains` (the shared validator the Repeater send path
