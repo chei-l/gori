@@ -186,3 +186,94 @@ describe "a stop during a retry's wait for the project budget" do
     rows[0].error.should eq("read: Connection reset by peer")
   end
 end
+
+# Answers the first request on each connection, then closes it.
+private def answer_once_origin : {TCPServer, Int32}
+  srv = TCPServer.new("127.0.0.1", 0)
+  spawn do
+    while conn = srv.accept?
+      c = conn
+      spawn do
+        if Gori::Proxy::Codec::Http1.read_head(c)
+          c << "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+          c.flush
+        end
+      rescue
+      ensure
+        c.close rescue nil
+      end
+    end
+  end
+  {srv, srv.local_address.port}
+end
+
+private def budget_outbound(store : Gori::Store) : Gori::Outbound
+  store.set_settings([{Gori::Settings::PROJECT_OUTBOUND_MAX_REQUESTS_KEY, "10"}] of {String, String?})
+  Gori::Outbound.interactive(Gori::Scope.load(store))
+end
+
+private def spent(store : Gori::Store) : String?
+  Gori::Outbound::Budget.release(store)
+  store.setting(Gori::Store::OUTBOUND_BUDGET_SPENT_KEY)
+end
+
+# A group's slots are taken up front; one for a request that never went out comes back.
+describe "a fuzz group send's project budget slots" do
+  it "refunds the pipeline members skipped after the connection died" do
+    with_store do |store|
+      srv, port = answer_once_origin
+      sender = F::Sender.new(F::Origin.new("http", "127.0.0.1", port), budget_outbound(store),
+        http2: false, verify: false)
+      req = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_slice
+      results = sender.send_pipeline([req, req, req, req])
+      srv.close
+      results.count(&.error.== Gori::Repeater::Engine::PIPELINE_SKIPPED).should eq(2)
+      spent(store).should eq("2") # was 4
+    end
+  end
+
+  it "refunds the warm-up slots of race connections that never dialled" do
+    with_store do |store|
+      sender = F::Sender.new(F::Origin.new("http", "127.0.0.1", 1), budget_outbound(store),
+        http2: false, verify: false)
+      bytes = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_slice
+      jobs = Array.new(2) { |i| F::Job.new(i.to_i64, [] of String, nil, bytes) }
+      sender.send_race(jobs, warmup: bytes).each(&.error.to_s.should(start_with("race: dial failed")))
+      spent(store).should eq("2") # was 4: one per member, plus a warm-up that never went out
+    end
+  end
+end
+
+# Holds the cap's re-send veto, the hook a pooled `Sender` calls before a stale re-send.
+private class VetoCapture < F::Backend
+  getter veto : Proc(String?, String?)? = nil
+
+  def origin : F::Origin
+    F::Origin.new("http", "x", 80)
+  end
+
+  def resend_veto=(veto : Proc(String?, String?)) : Nil
+    @veto = veto
+  end
+
+  def send(bytes : Bytes) : Gori::Repeater::Result
+    Gori::Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, nil)
+  end
+end
+
+describe "a pooled re-send the project budget refuses" do
+  # The row keeps the first copy's failure, so the cap has to hear the refusal to end the run
+  # `budget_exhausted` rather than `done` with an error row.
+  it "latches the refusal on the cap, as a refused send does" do
+    inner = VetoCapture.new
+    capped = F::CappedBackend.new(inner, nil)
+    inner.veto.not_nil!.call(Gori::Outbound::BUDGET_SPENT_ERROR).should eq(Gori::Outbound::BUDGET_SPENT_ERROR)
+    capped.budget_refusal.should eq(Gori::Outbound::BUDGET_SPENT_ERROR)
+    capped.cap_reached?.should be_true
+    # …but a stop ending the wait is the operator's stop, not the budget's.
+    inner2 = VetoCapture.new
+    capped2 = F::CappedBackend.new(inner2, nil)
+    inner2.veto.not_nil!.call(Gori::Outbound::BUDGET_STOPPED_ERROR)
+    capped2.budget_refusal.should be_nil
+  end
+end

@@ -126,11 +126,35 @@ describe "Fuzz::Engine#follow_redirects — resolving the Location" do
     follow(F::Origin.new("http", "h", 80), ["a b"]).size.should eq(1)
   end
 
+  # A template with no `Host:` of its own: the hop falls back to the dial origin's authority.
   it "brackets an IPv6 literal in the hop's Host header" do
-    sent = follow(F::Origin.new("http", "::1", 8080), ["/x", nil])
+    hostless = "GET /dir/start?q=§a§ HTTP/1.1\r\n\r\n"
+    sent = follow(F::Origin.new("http", "::1", 8080), ["/x", nil], tpl: hostless)
     sent[1].should contain("Host: [::1]:8080\r\n")
-    sent = follow(F::Origin.new("https", "::1", 443), ["/x", nil])
+    sent = follow(F::Origin.new("https", "::1", 443), ["/x", nil], tpl: hostless)
     sent[1].should contain("Host: [::1]\r\n") # default port omitted
+  end
+
+  # A vhost dialled by address: the hop addresses the vhost the template addressed, and an
+  # absolute `Location` naming that vhost is same-origin — the hop dials the same socket.
+  it "writes the template's own Host on the hop, and follows an absolute Location to it" do
+    vhost = "GET /start?q=§a§ HTTP/1.1\r\nHost: app.internal\r\n\r\n"
+    sent = follow(F::Origin.new("http", "10.0.0.5", 80), ["/next", "http://APP.internal/abs", nil], tpl: vhost)
+    request_lines(sent).should eq(["GET /start?q=1 HTTP/1.1", "GET /next HTTP/1.1", "GET /abs HTTP/1.1"])
+    sent[1].should contain("\r\nHost: app.internal\r\n")
+    sent[2].should contain("\r\nHost: app.internal\r\n")
+    # The dial origin's own authority is still same-origin; another host still is not.
+    follow(F::Origin.new("http", "10.0.0.5", 80), ["http://10.0.0.5/x", nil], tpl: vhost).size.should eq(2)
+    follow(F::Origin.new("http", "10.0.0.5", 80), ["http://other/x"], tpl: vhost).size.should eq(1)
+  end
+
+  # Two `Host:` lines, or one gori could not write back into a line it authors, are tests of
+  # their own: the hop uses the dial origin rather than pick one or splice the bytes.
+  it "falls back to the dial origin for a duplicated or unwritable template Host" do
+    dup = "GET /s?q=§a§ HTTP/1.1\r\nHost: a.test\r\nHost: b.test\r\n\r\n"
+    follow(F::Origin.new("http", "10.0.0.5", 80), ["/x", nil], tpl: dup)[1].should contain("\r\nHost: 10.0.0.5\r\n")
+    spaced = "GET /s?q=§a§ HTTP/1.1\r\nHost: a.test evil\r\n\r\n"
+    follow(F::Origin.new("http", "10.0.0.5", 80), ["/x", nil], tpl: spaced)[1].should contain("\r\nHost: 10.0.0.5\r\n")
   end
 
   it "writes no Connection: close on an h2 hop (a connection-specific field h2 forbids)" do
@@ -209,5 +233,86 @@ describe "Fuzz::Engine#run_race — a raise before the release" do
     errors[0].message.should eq("chain exploded")
     events.last.should be_a(F::DoneEvent)
     be.sent.should eq(0)
+  end
+end
+
+# Answers send n with a 302 to locs[n] (a Proc of the request), else 200.
+private class HopReflectBackend < F::Backend
+  getter sent = [] of String
+
+  def initialize(@origin : F::Origin, @locs : Array(Proc(String, String?)))
+  end
+
+  def origin : F::Origin
+    @origin
+  end
+
+  def send(bytes : Bytes) : Gori::Repeater::Result
+    req = String.new(bytes)
+    @sent << req
+    loc = @locs[@sent.size - 1]?.try(&.call(req))
+    head = (loc ? "HTTP/1.1 302 Found\r\nLocation: #{loc}\r\nContent-Length: 0\r\n\r\n" : "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").to_slice
+    Gori::Repeater::Result.new(head, Bytes.new(0), Gori::Proxy::Codec::Http1.parse_response_head(head), 1_i64)
+  end
+end
+
+private def run_hops(origin, tpl, payload, locs : Array(Proc(String, String?)))
+  cfg = F::Config.new(concurrency: 1, follow_redirects: true, max_redirects: 5)
+  gen = F::Generator.new(F::Template.parse(tpl), [F::PayloadSet.new(F::InlineList.new([payload]))], cfg)
+  be = HopReflectBackend.new(origin, locs)
+  results = [] of F::Result
+  F::Engine.new(gen, F::Matcher.new, be, cfg).run { |ev| results << ev.result if ev.is_a?(F::ResultEvent) }
+  {be.sent, results}
+end
+
+private def hop_host_of(req : String) : String?
+  req.lines.find(&.downcase.starts_with?("host:")).try(&.[5..].strip)
+end
+
+# Redirect hops and the template Host (round-3 audit): only the template's own Host, as a bare
+# authority, on the dial port; a Location naming the dial address takes that address.
+describe "Fuzz redirect hops and the template Host" do
+  # Host-header injection sweep: the server builds an absolute Location from the Host it was sent.
+  it "keeps a Host-header payload's reflected absolute Location as the row" do
+    reflect = ->(r : String) { "http://#{hop_host_of(r)}/login".as(String?) }
+    sent, results = run_hops(F::Origin.new("http", "10.0.0.5", 80), "GET /reset HTTP/1.1\r\nHost: §a§\r\n\r\n", "evil.test",
+      [reflect, ->(_r : String) { nil.as(String?) }])
+    sent.size.should eq(1)
+    results[0].status.should eq(302)
+  end
+
+  it "sends a Location naming the dial address with that address as Host" do
+    sent, _ = run_hops(F::Origin.new("http", "10.0.0.5", 80), "GET /s?q=§a§ HTTP/1.1\r\nHost: app.internal\r\n\r\n", "1",
+      [->(_r : String) { "http://10.0.0.5/x".as(String?) }, ->(_r : String) { nil.as(String?) }])
+    sent.size.should eq(2)
+    hop_host_of(sent[1]).should eq("10.0.0.5")
+  end
+
+  it "does not follow a Location on another port than the one dialled" do
+    sent, _ = run_hops(F::Origin.new("http", "h.test", 8080), "GET /s?q=§a§ HTTP/1.1\r\nHost: h.test\r\n\r\n", "1",
+      [->(_r : String) { "http://h.test/other-port".as(String?) }, ->(_r : String) { nil.as(String?) }])
+    sent.size.should eq(1)
+  end
+
+  it "keeps an IPv6 Host spelling on the hop" do
+    sent, _ = run_hops(F::Origin.new("http", "::1", 8080), "GET /s?q=§a§ HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n", "1",
+      [->(_r : String) { "/n".as(String?) }, ->(_r : String) { nil.as(String?) }])
+    hop_host_of(sent[1]).should eq("[::1]:8080")
+    sent, _ = run_hops(F::Origin.new("http", "::1", 8080), "GET /s?q=§a§ HTTP/1.1\r\nHost: ::1\r\n\r\n", "1",
+      [->(_r : String) { "/n".as(String?) }, ->(_r : String) { nil.as(String?) }])
+    hop_host_of(sent[1]).should eq("[::1]:8080")
+  end
+
+  it "falls back to the dial origin for a Host with userinfo" do
+    sent, _ = run_hops(F::Origin.new("http", "10.0.0.5", 80), "GET /s?q=§a§ HTTP/1.1\r\nHost: u@evil.test\r\n\r\n", "1",
+      [->(_r : String) { "/n".as(String?) }, ->(_r : String) { nil.as(String?) }])
+    hop_host_of(sent[1]).should eq("10.0.0.5")
+  end
+
+  it "falls back to the dial origin for a Host with a path" do
+    sent, _ = run_hops(F::Origin.new("http", "10.0.0.5", 80), "GET /dir/s?q=§a§ HTTP/1.1\r\nHost: a.test/zz\r\n\r\n", "1",
+      [->(_r : String) { "next".as(String?) }, ->(_r : String) { nil.as(String?) }])
+    sent[1].lines.first.should eq("GET /dir/next HTTP/1.1")
+    hop_host_of(sent[1]).should eq("10.0.0.5")
   end
 end
