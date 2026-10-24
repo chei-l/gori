@@ -633,7 +633,7 @@ module Gori::Fuzz
       # hops, and `calibrate_baseline`, whose nonces are safe but whose CARRIER is this same
       # template rendered with them.
       sender = Sender.new(origin, outbound, http2: options.http2?, verify: options.verify?,
-        sni: options.sni, timeout: config.timeout, overrides: options.overrides,
+        sni: resolve_sni(options.sni), timeout: config.timeout, overrides: options.overrides,
         # Forced OFF for a WebSocket run, silently. One variation is one session on its own
         # socket, which `WsEngine` closes in its own `ensure` — there is nothing for the pool
         # to park. Silently because `keep_alive` DEFAULTS true, so reporting it as ignored
@@ -845,6 +845,13 @@ module Gori::Fuzz
       out
     end
 
+    # The SNI override expanded as the Repeater plan expands it (`FlowRequest.dial_sni`).
+    private def self.resolve_sni(raw : String?) : String?
+      Repeater::FlowRequest.dial_sni(raw)
+    rescue e : Repeater::FlowRequest::DialTargetError
+      raise PlanError.new(PlanError::Reason::UnresolvedEnv, e.message.to_s, e.detail)
+    end
+
     # The explicit target when it has one, else the seeding flow's. Blank counts as absent
     # (an agent that sends `"url": ""` means "use the flow's", not "fail").
     private def self.resolve_origin(options : PlanOptions) : Origin
@@ -1047,7 +1054,11 @@ module Gori::Fuzz
           # skip exists to prevent. One byte of separation is enough: `§x§Z§b§` is two
           # positions. (The advance above is therefore `<`, not `<=`: a span ending AT `i`
           # still touches an occurrence starting there.)
-          if si < spans.size && i + needle.size >= spans[si][0]
+          # An ESCAPED `§§` right after the token is not in `spans` but touches all the same:
+          # `5§§` would wrap to `§5§§§`, whose inner `§§` `parse` reads as an escape, so the
+          # position becomes `5§` and the capture's literal `§` is swept away with each payload.
+          if (si < spans.size && i + needle.size >= spans[si][0]) ||
+             hay[i + needle.size, marker.size]? == marker
             shadowed = true
           else
             io.write(marker)

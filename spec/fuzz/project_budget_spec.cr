@@ -91,3 +91,98 @@ describe "a $GEN value under the project rate" do
     end
   end
 end
+
+# Answers the first send; every later one waits for the budget until the run is stopped, and then
+# comes back the way `Outbound#admit` does when its `halt` ends the wait.
+private class StopWaitBackend < F::Backend
+  property engine : F::Engine? = nil
+
+  def initialize(@origin : F::Origin)
+    @calls = 0
+  end
+
+  def origin : F::Origin
+    @origin
+  end
+
+  def send(bytes : Bytes) : Gori::Repeater::Result
+    @calls += 1
+    if @calls == 1
+      head = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n".to_slice
+      return Gori::Repeater::Result.new(head, "ok".to_slice, Gori::Proxy::Codec::Http1.parse_response_head(head), 1_i64)
+    end
+    until engine.try(&.stopped?)
+      sleep 10.milliseconds
+    end
+    Gori::Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, Gori::Outbound::BUDGET_STOPPED_ERROR)
+  end
+end
+
+describe "a stop during a wait for the project budget" do
+  it "leaves no row for the payloads that were never sent" do
+    backend = StopWaitBackend.new(F::Origin.new("http", "x", 80))
+    tmpl = F::Template.parse("GET /?q=§a§ HTTP/1.1\r\nHost: x\r\n\r\n")
+    cfg = F::Config.new(mode: F::Mode::Sniper, concurrency: 4)
+    engine = F::Engine.new(F::Generator.new(tmpl, [F::PayloadSet.new(F::InlineList.new((1..10).map(&.to_s)))], cfg),
+      F::Matcher.new, backend, cfg)
+    backend.engine = engine
+    rows = [] of F::Result
+    done = nil.as(F::DoneEvent?)
+    spawn do
+      sleep 100.milliseconds
+      engine.stop
+    end
+    engine.run do |ev|
+      rows << ev.result if ev.is_a?(F::ResultEvent)
+      done = ev if ev.is_a?(F::DoneEvent)
+    end
+    d = done.should_not be_nil
+    rows.size.should eq(1)
+    d.progress.errors.should eq(0)
+    d.progress.blocked.should eq(0)
+    d.progress.blocked_reason.should be_nil
+  end
+end
+
+# A retry that waits for the budget and is stopped there sent nothing, but the attempt it was
+# retrying did go out: its failure is the row.
+private class FailThenStopWaitBackend < F::Backend
+  property engine : F::Engine? = nil
+  getter calls = 0
+
+  def initialize(@origin : F::Origin)
+  end
+
+  def origin : F::Origin
+    @origin
+  end
+
+  def send(bytes : Bytes) : Gori::Repeater::Result
+    @calls += 1
+    return Gori::Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, "read: Connection reset by peer") if @calls == 1
+    until engine.try(&.stopped?)
+      sleep 10.milliseconds
+    end
+    Gori::Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, Gori::Outbound::BUDGET_STOPPED_ERROR)
+  end
+end
+
+describe "a stop during a retry's wait for the project budget" do
+  it "keeps the row of the attempt that was sent" do
+    backend = FailThenStopWaitBackend.new(F::Origin.new("http", "x", 80))
+    tmpl = F::Template.parse("GET /?q=§a§ HTTP/1.1\r\nHost: x\r\n\r\n")
+    cfg = F::Config.new(mode: F::Mode::Sniper, concurrency: 1, retries: 2, retry_pause: 10.milliseconds)
+    engine = F::Engine.new(F::Generator.new(tmpl, [F::PayloadSet.new(F::InlineList.new(["1"]))], cfg),
+      F::Matcher.new, backend, cfg)
+    backend.engine = engine
+    rows = [] of F::Result
+    spawn do
+      sleep 150.milliseconds
+      engine.stop
+    end
+    engine.run { |ev| rows << ev.result if ev.is_a?(F::ResultEvent) }
+    backend.calls.should eq(2)
+    rows.size.should eq(1)
+    rows[0].error.should eq("read: Connection reset by peer")
+  end
+end

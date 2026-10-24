@@ -838,7 +838,8 @@ module Gori::Fuzz
     private def settle(r : Repeater::Result) : Repeater::Result
       if (e = r.error) && Gori::Outbound.budget_refusal?(e)
         @sent -= 1
-        @budget_refusal ||= e
+        # A stop ending the wait is the operator's stop, not the budget's refusal.
+        @budget_refusal ||= e unless e == Gori::Outbound::BUDGET_STOPPED_ERROR
       end
       r
     end
@@ -1385,7 +1386,9 @@ module Gori::Fuzz
         # Through the request-time macro's gate when the run has one (#1350), and per ATTEMPT: a
         # retry is a request, so a `request` cadence gives it a value of its own.
         raw = candidate_send { @backend.send(job.bytes, job.payload_spans) }
-        return nil unless raw
+        # nil: this attempt was never sent (stopped at a gate). A RETRY's earlier attempt was, so
+        # its failure is still the row.
+        return failed.try { |f| @matcher.build(job, f, resent_count: resent_count - 1) } unless raw
         # A retry the budget refused sent nothing: the row is the failure it was retrying, and
         # that retry was never a superseded attempt. Returning the cap marker read a dead origin
         # as "the budget ran out" (as in Discover/Miner/Sequencer's `send_with_retries`).
@@ -1457,7 +1460,7 @@ module Gori::Fuzz
       failed = nil.as({Repeater::Result, WsOutcome}?)
       loop do
         pair = ws_send(job, frames)
-        return nil unless pair
+        return failed.try { |f| @matcher.build(job, f[0], resent_count: resent_count - 1).with_ws(f[1]) } unless pair
         raw, ws = pair
         # As in `run_one`: a budget-refused retry answers with the failure it was retrying.
         if (prior = failed) && raw.error == CappedBackend::CAP_ERROR
@@ -1505,7 +1508,9 @@ module Gori::Fuzz
     # ── request-time macro (#1350) ───────────────────────────────────────────────
 
     # One candidate send, through the macro's gate when the run has one; nil when the run was
-    # stopped while the candidate waited (nothing was sent, so there is nothing to report).
+    # stopped while the candidate waited — at that gate or for the project budget — so nothing
+    # was sent and there is nothing to report (a budget wait used to land as an errored,
+    # "blocked" payload row).
     #
     # A refused candidate — the steps failed, or the run was already ended by them — comes back
     # as an ORDINARY errored `Repeater::Result` whose error carries `RequestMacro::ERROR_PREFIX`,
@@ -1513,32 +1518,38 @@ module Gori::Fuzz
     # never be mistaken for the target's answer. The gate holds the candidate for the whole send
     # (see `RequestMacro::Lane` for the epochs that makes true), so the block runs INSIDE it.
     private def candidate_send(& : -> Repeater::Result) : Repeater::Result?
-      lane = @request_macro
-      return yield unless lane
-      lane.around do |entry|
-        if entry.send?
-          yield
-        elsif entry.cancelled?
-          nil
-        else
-          Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, entry.error)
-        end
-      end
+      r = if lane = @request_macro
+            lane.around do |entry|
+              if entry.send?
+                yield
+              elsif entry.cancelled?
+                nil
+              else
+                Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, entry.error)
+              end
+            end
+          else
+            yield
+          end
+      r unless r && stopped_at_budget?(r)
     end
 
     # `candidate_send` for one WebSocket session.
     private def ws_send(job : Job, frames : Array(WsFrame)) : {Repeater::Result, WsOutcome}?
-      lane = @request_macro
-      return @backend.send_ws(job.bytes, frames, job.payload_spans) unless lane
-      lane.around do |entry|
-        if entry.send?
-          @backend.send_ws(job.bytes, frames, job.payload_spans)
-        elsif entry.cancelled?
-          nil
-        else
-          {Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, entry.error), WsOutcome.failed}
-        end
-      end
+      pair = if lane = @request_macro
+               lane.around do |entry|
+                 if entry.send?
+                   @backend.send_ws(job.bytes, frames, job.payload_spans)
+                 elsif entry.cancelled?
+                   nil
+                 else
+                   {Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, entry.error), WsOutcome.failed}
+                 end
+               end
+             else
+               @backend.send_ws(job.bytes, frames, job.payload_spans)
+             end
+      pair unless pair && stopped_at_budget?(pair[0])
     end
 
     # A race group is ONE unit for the macro: the steps run once, before the group is dialled,
@@ -1576,6 +1587,10 @@ module Gori::Fuzz
     # and they are matched in ONE place, `Outbound.permanent_refusal?`. The name stays local
     # because a gate refusal is a `@blocked` PAYLOAD UNIT on this path, which a cap stop is not
     # (see `run_one`) — so unlike the Miner/Sequencer wrappers this one must not fold the cap in.
+    private def stopped_at_budget?(raw : Repeater::Result) : Bool
+      @stopped && raw.error == Gori::Outbound::BUDGET_STOPPED_ERROR
+    end
+
     private def gate_refused?(err : String?) : Bool
       Gori::Outbound.permanent_refusal?(err)
     end

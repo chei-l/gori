@@ -328,7 +328,7 @@ module Gori::Fuzz
       chain_error ||= field_error
       bytes = raw
       if @config.update_content_length?
-        bytes, at, delta = ContentLength.sync_at(raw, true)
+        bytes, at, delta = ContentLength.sync_at(raw, true, substituted(spans, pos))
         spans = shift_spans(spans, at, delta) unless delta == 0
       end
       bytes = reframed(bytes)
@@ -357,21 +357,31 @@ module Gori::Fuzz
       r = script.render_spans(values)
       hs, spans = r.handshake, r.handshake_spans
       if @config.update_content_length?
-        hs, at, delta = ContentLength.sync_at(hs, true)
+        hs, at, delta = ContentLength.sync_at(hs, true, substituted(spans, pos))
         spans = shift_spans(spans, at, delta) unless delta == 0
       end
       Job.new(idx, payloads, pos, hs, spans, chain_error, r.frames)
+    end
+
+    # The spans of the payloads THIS variation substituted — the ones whose framing it may have
+    # written. A Sniper variation fills only `pos`; every other position holds its template
+    # default, and a marked `Content-Length: §3§` left at its default must still be resynced
+    # while a body position grows. Public for `FuzzerView`'s row reconstruction.
+    def self.substituted(spans : Array({Int32, Int32}), pos : Int32?) : Array({Int32, Int32})
+      return spans unless pos
+      (s = spans[pos]?) ? [s] : [] of {Int32, Int32}
+    end
+
+    private def substituted(spans : Array({Int32, Int32}), pos : Int32?) : Array({Int32, Int32})
+      Generator.substituted(spans, pos)
     end
 
     # `spans` moved across the Content-Length rewrite, which is the one pass that runs
     # between the splice and the wire and can change a byte offset. `at`/`delta` come from
     # `ContentLength.sync_at`: everything at or past `at` moved by `delta`.
     #
-    # A span that lay INSIDE the rewritten header line is left where it is rather than
-    # dropped. Those payload bytes have no image in the output — the line was replaced by
-    # the canonical `Content-Length: N` — so the range now covers digits gori wrote itself,
-    # and excluding those from a `$NAME` scan is a no-op either way. Dropping it would be a
-    # silent narrowing of the exclusion instead, which is the direction that bites.
+    # No span lies inside the rewritten line or across `at`: `sync_at` leaves a request whose
+    # framing a payload wrote untouched.
     private def shift_spans(spans : Array({Int32, Int32}), at : Int32,
                             delta : Int32) : Array({Int32, Int32})
       spans.map { |(a, b)| a >= at ? {a + delta, b + delta} : {a, b} }

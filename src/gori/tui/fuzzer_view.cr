@@ -440,6 +440,10 @@ module Gori::Tui
       @http2 = built.http2
       @target = built.target
       @tcx = @target.size
+      # The capture's SNI when it is not just the host (`FlowRequest.seed_sni`): a sweep of a
+      # fronted / vhost-routed flow has to present the name the client did.
+      @sni = Repeater::FlowRequest.seed_sni(detail) || ""
+      @scx = @sni.size
       @target_field = :url
       @editor.set_text(String.new(Fuzz::Template.escape_literal_markers(built.bytes)))
       @evidence = true
@@ -3939,9 +3943,10 @@ module Gori::Tui
       # (`Job#position`): only the substituted position was encoded, the rest kept their
       # template defaults.
       payloads = (@run_auto_encode || Fuzz::AutoEncode.none).apply(payloads, r.position)
-      raw = grpc ? grpc.render_spans(payloads)[0] : tmpl.render(payloads)
+      raw, spans = grpc ? grpc.render_spans(payloads)[0..1] : tmpl.render_spans(payloads)
       sync, add, _ = run_policy
-      raw = Fuzz::ContentLength.sync(raw, add) if sync
+      # With the spans, as `Generator#emit` does: a payload that wrote its own framing kept it.
+      raw = Fuzz::ContentLength.sync_at(raw, add, Fuzz::Generator.substituted(spans, r.position))[0] if sync
       # AFTER the Content-Length pass, the order `Generator#emit` uses and for its reason: the
       # reframe is size-preserving, so it can neither invalidate the CL just written nor move a
       # byte. Skipped when THAT run did not reframe (`@run_reframe_grpc`), which is the common case.

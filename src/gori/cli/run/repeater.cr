@@ -939,6 +939,9 @@ module Gori
             if tgt_str.empty?
               bt = built.target
               tgt_str = bt ? bt : ""
+              # The capture's SNI goes with the capture's origin, never onto an operator's
+              # `--target`; an explicit `--sni` wins. MCP `create_repeater{flow_id}` does the same.
+              sni ||= Repeater::FlowRequest.seed_sni(detail)
             end
 
             # A `--curl` request already said which protocol it speaks (`--http2` or not), and with
@@ -2814,6 +2817,9 @@ module Gori
           return "incomplete — gori stopped the event stream at its time bound (--sse-time / sse_max_ms)"
         when "cancelled"
           return "incomplete — the send was cancelled while the event stream was open"
+        when "budget"
+          return "incomplete — the body was still arriving when gori stopped reading at its " \
+                 "whole-read budget (three times the timeout; raise the timeout to read the rest)"
         end
         if (b = result.body) && b.size >= cap
           "incomplete — gori stopped reading at its #{cap // (1024 * 1024)} MiB capture ceiling"

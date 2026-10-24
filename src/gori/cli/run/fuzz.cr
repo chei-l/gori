@@ -271,7 +271,9 @@ module Gori
         default_target = seed.target
         evidence = seed.evidence
         # An explicit --sni wins; otherwise the source's own (a repeater session's stored SNI).
-        sni ||= seed.sni
+        # A capture's SNI goes with the capture's origin, never onto a `--target` (as
+        # `repeater create --flow` has it).
+        sni ||= seed.sni unless flow_id && target_override
         # …and the same precedence for the fingerprint. `||=` rather than a `presence` fold, so
         # an explicit `--tls-preset ""` still means "no override for this run" and can take the
         # baseline half of an A/B against a tab that carries one.
@@ -723,7 +725,8 @@ module Gori
       # chosen source. `is-evidence` is PROVENANCE, not a knob: only the `--flow` branch, and
       # `--repeater` on a session still holding its flow seed's bytes, hand back captured bytes,
       # and only they may therefore skip the draft-time passes (see `Fuzz::PlanOptions#evidence?`).
-      # `sni` is the SOURCE's stored SNI (only a repeater session carries one) and is a DEFAULT —
+      # `sni` is the SOURCE's stored SNI (a repeater session's, or a flow's when it differs from
+      # the host: `FlowRequest.seed_sni`) and is a DEFAULT —
       # an explicit `--sni` still wins.
       private def self.fuzz_source(flow_id : Int64?, repeater_id : Int64?, request_file : String?,
                                    project_name : String?, db_path : String?) : FuzzSeed
@@ -766,7 +769,7 @@ module Gori
           # also true of a non-WebSocket 101 whose transcript holds only gori's own notice.
           hs = String.new(Fuzz::Template.escape_literal_markers(built.bytes))
           ws = Repeater::WsEngine.replayable?(hs) ? fuzz_ws_seed_flow(id, project_name, db_path) : nil
-          FuzzSeed.new(hs, built.target, built.http2, true, nil, ws)
+          FuzzSeed.new(hs, built.target, built.http2, true, Repeater::FlowRequest.seed_sni(detail), ws)
         elsif !STDIN.tty?
           FuzzSeed.new(read_stdin_fallback(STDIN, "gori run fuzz", "request"), nil, false, false, nil)
         else

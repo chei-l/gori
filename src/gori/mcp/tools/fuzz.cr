@@ -635,6 +635,9 @@ module Gori
         # seed session's stored SNI AND reaching the dial as an empty name, which OpenSSL
         # treats as "send no SNI extension, check no hostname". `send_request`/`discover`
         # already read theirs this way.
+        # A capture's SNI goes with the capture's origin, never onto a caller's `url` (as
+        # `create_repeater{flow_id}` has it).
+        src_sni = nil if optional_int_arg(h, "flow_id") && str(h, "url").presence
         effective_sni = str(h, "sni").presence || src_sni
         config = fuzz_config(h, mode, src_tls_preset)
         matcher = fuzz_matcher(h)
@@ -837,7 +840,8 @@ module Gori
           # capture that is legitimately not valid UTF-8 had every such byte rewritten to
           # U+FFFD, with Content-Length resynced to the corruption, before the sweep ran.
           # `render` puts the single `§` back, so the request still replays byte-exact.
-          return {String.new(Fuzz::Template.escape_literal_markers(built.bytes)), built.target, built.http2, true, nil, nil}
+          return {String.new(Fuzz::Template.escape_literal_markers(built.bytes)), built.target, built.http2, true,
+                  Repeater::FlowRequest.seed_sni(detail), nil}
         end
         if rid = optional_int_arg(h, "repeater_id")
           rec = store.get_repeater(rid)

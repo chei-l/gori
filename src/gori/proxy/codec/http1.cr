@@ -114,7 +114,10 @@ module Gori::Proxy::Codec::Http1
         if @bytes.empty?
           "#{label} read timed out before any bytes arrived"
         else
-          "#{label} not CRLFCRLF-terminated within #{deadline.total_seconds.to_i} s (#{@bytes.size} bytes received)"
+          # "Before the read timed out", not "within <deadline>": the idle timeout can end a
+          # stalled head sooner (`arm_remaining`), and the deadline is only the upper bound.
+          "#{label} not CRLFCRLF-terminated before the read timed out (#{@bytes.size} bytes received, " \
+          "head deadline #{deadline.total_seconds.to_i} s)"
         end
       when State::Failed
         message = @error.try(&.message).presence || "upstream read failed"
@@ -228,9 +231,10 @@ module Gori::Proxy::Codec::Http1
   private def self.fill_head(io : IO, buf : IO::Memory, max_bytes : Int32, sock : ::Socket?,
                              deadline : Time::Span, settled : Bool, lf_terminator : Bool) : Nil
     head_started = nil.as(Time::Instant?)
+    idle = sock.try(&.read_timeout)
     while buf.bytesize < max_bytes
       if sock && (hs = head_started)
-        arm_remaining(sock, deadline - (Time.instant - hs))
+        arm_remaining(sock, deadline - (Time.instant - hs), idle)
       end
       if chunk = io.peek
         break if chunk.empty? # EOF
@@ -430,9 +434,12 @@ module Gori::Proxy::Codec::Http1
   # Shrink `sock`'s read_timeout toward what is LEFT of the head deadline, raising when it is
   # spent — the drip-feed bound, re-armed before every read so a trickle cannot keep resetting it.
   # One caller; a method rather than inline so the loop above reads as the four steps it is.
-  private def self.arm_remaining(sock : ::Socket, remaining : Time::Span) : Nil
+  #
+  # Never ABOVE the caller's own idle bound: a 1 s Repeater timeout used to become up to the
+  # whole head deadline once the first head byte had arrived.
+  private def self.arm_remaining(sock : ::Socket, remaining : Time::Span, idle : Time::Span?) : Nil
     raise IO::TimeoutError.new("request head incomplete before deadline") if remaining <= Time::Span.zero
-    sock.read_timeout = remaining
+    sock.read_timeout = idle && idle < remaining ? idle : remaining
   end
 
   # Turn a read head buffer into the returned bytes (or nil). A `buf` that hit the cap without a

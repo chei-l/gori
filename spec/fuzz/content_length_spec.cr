@@ -138,3 +138,50 @@ describe F::ContentLength do
     end
   end
 end
+
+private def only_job(template : String, payload : String) : F::Job
+  gen = F::Generator.new(F::Template.parse(template), [F::PayloadSet.new(F::InlineList.new([payload]))], F::Config.new)
+  job = nil.as(F::Job?)
+  gen.each { |j| job = j }
+  job.not_nil!
+end
+
+describe "the Content-Length pass and a payload that writes its own framing" do
+  # A header-injection payload carrying its own blank line is a smuggling test: gori used to
+  # insert `Content-Length:` in the middle of it, and the span then lost the payload's tail.
+  it "leaves a payload's own blank line, and the span over it, alone" do
+    j = only_job("POST / HTTP/1.1\r\nHost: t\r\nX: §v§\r\n\r\n", "a\r\n\r\n$TOKEN")
+    String.new(j.bytes).should eq("POST / HTTP/1.1\r\nHost: t\r\nX: a\r\n\r\n$TOKEN\r\n\r\n")
+    a, b = j.payload_spans[0]
+    String.new(j.bytes[a, b - a]).should eq("a\r\n\r\n$TOKEN")
+  end
+
+  it "sends a marked Content-Length value as the payload, not the measured length" do
+    j = only_job("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: §5§\r\n\r\nhello", "0")
+    String.new(j.bytes).should eq("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\nhello")
+  end
+
+  it "keeps an EMPTY marked Content-Length value" do
+    j = only_job("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: §5§\r\n\r\nhello", "")
+    String.new(j.bytes).should eq("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: \r\n\r\nhello")
+  end
+
+  # Sniper fills one position; a marked Content-Length left at its default is gori's to resync
+  # while the body position grows.
+  it "resyncs a marked Content-Length that this Sniper variation did not fill" do
+    cfg = F::Config.new(mode: F::Mode::Sniper)
+    gen = F::Generator.new(F::Template.parse("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: §3§\r\n\r\na=§b§"),
+      [F::PayloadSet.new(F::InlineList.new(["xxxxxx"]))], cfg)
+    js = [] of F::Job
+    gen.each { |j| js << j }
+    String.new(js.find { |j| j.position == 1 }.not_nil!.bytes)
+      .should eq("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 8\r\n\r\na=xxxxxx")
+    String.new(js.find { |j| j.position == 0 }.not_nil!.bytes)
+      .should eq("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: xxxxxx\r\n\r\na=b")
+  end
+
+  it "still measures a body payload" do
+    j = only_job("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 1\r\n\r\n§x§", "abc")
+    String.new(j.bytes).should eq("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc")
+  end
+end
