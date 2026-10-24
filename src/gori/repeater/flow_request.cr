@@ -39,6 +39,7 @@ module Gori
         head = detail.request_head
         body = detail.request_body
         refuse_pseudo_header_head(head)
+        head = drop_capture_markers(head) if detail.http_version == "HTTP/2"
         # The captured body is capped at CAPTURE_MAX. If it was truncated, a faithful
         # h1 repeater would BLOCK the origin waiting for bytes that no longer exist (a
         # Content-Length over-promising, or a chunked stream cut before its 0-chunk). Byte-
@@ -53,6 +54,21 @@ module Gori
           sni: detail.sni,
           rewrote_request_line: rewrote,
         )
+      end
+
+      # gori's capture-only annotation lines on a synthesized h2 head (`HeadCodec.synth_request`):
+      # no client sent them, and a replay put them on the wire as ordinary fields. NOT the
+      # `X-Gori-Protocol` marker — `H2Engine.parse_request` folds that back into `:protocol`, which
+      # is what lets a captured RFC 8441 WebSocket be re-opened.
+      SEED_DROPPED_MARKERS = Export::Curl::MARKER_HEADERS - [Proxy::H2::HeadCodec::PROTOCOL_MARKER.downcase]
+
+      private def self.drop_capture_markers(head : Bytes) : Bytes
+        lines = String.new(head).split("\r\n")
+        kept = lines.reject do |line|
+          name, sep, _ = line.partition(':')
+          !sep.empty? && SEED_DROPPED_MARKERS.includes?(name.downcase)
+        end
+        kept.size == lines.size ? head : kept.join("\r\n").to_slice
       end
 
       # Would `build` refuse this head? The predicate behind `refuse_pseudo_header_head`, public
@@ -82,6 +98,21 @@ module Gori
           "(first line: #{line[0, 60].inspect}). It is an h2 field list recorded as HTTP/1.1 head " \
           "text; sending it would put that field on the wire AS the start line and leave every " \
           "later header off by one. Re-send it field-natively (`gori run repeater h2 --fields`).")
+      end
+
+      # The head an EXPORT of `detail` writes: self-framed over the stored bytes when the
+      # captured body was capped (the same rule a replay uses), else the head as captured. A
+      # copied command that kept the original, larger Content-Length waited on bytes that were
+      # never stored.
+      #
+      # For the DERIVED exports only (cURL and the code clients): a "Raw request" copy is the
+      # captured bytes, CL.TE pair and all.
+      def self.export_head(head : Bytes, body : Bytes?, truncated : Bool) : Bytes
+        truncated ? resync_truncated_head(head, body.try(&.size) || 0) : head
+      end
+
+      def self.export_head(detail : Store::FlowDetail) : Bytes
+        export_head(detail.request_head, detail.request_body, detail.request_body_truncated?)
       end
 
       # Make a TRUNCATED request self-framed so the repeater can't hang. Used ONLY when the
@@ -178,6 +209,10 @@ module Gori
           # Rewriting an EXISTING Content-Length keeps its pre-existing behaviour: this guard is
           # only about ADDING framing to bytes we could not parse.
           return bytes if lines.any?(&.includes?('\n'))
+          # …and only into a head that HAS a start line. Leading blank lines (RFC 9112 §2.2:
+          # a recipient ignores them) put the separator at offset 0, so the real request reads
+          # as "body" and a Content-Length over it would turn it into one.
+          return bytes if lines.all?(&.empty?)
           lines << "Content-Length: #{body.bytesize}"
         else
           return bytes
@@ -573,13 +608,14 @@ module Gori
       # editor's default LF). A captured multipart always carries CRLF (RFC 2046 §5.1.1
       # delimits parts with it and the part headers are CRLF-terminated), so it is left
       # byte-exact. ^X hex mode remains the byte-exact escape hatch either way.
+      #
+      # Split at `Env.head_body_separator`, a BYTE offset: a `String#index` here is a CHAR index,
+      # so one `é` in the head moved the cut a byte early and normalized the head's own `\r\n`.
       def self.normalize_multipart_body(bytes : Bytes) : Bytes
-        text = String.new(bytes)
-        sep = text.index("\r\n\r\n")
-        return bytes unless sep
-        body_at = sep + 4
+        sep, width = Env.head_body_separator(bytes) || return bytes
+        body_at = sep + width
         return bytes if body_at >= bytes.size
-        return bytes unless multipart_head?(text[0, sep])
+        return bytes unless multipart_head?(String.new(bytes[0, sep]))
         body = bytes[body_at..]
         return bytes if crlf?(body) # already wire-form — these bytes are evidence, not a draft
         head = bytes[0, body_at]

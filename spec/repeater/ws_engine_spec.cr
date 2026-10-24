@@ -834,6 +834,26 @@ describe "Gori::Repeater::WsEngine frame shapes" do
     end
   end
 
+  # gori cannot decode permessage-deflate, so the offer is stripped under `keep_key` too: that
+  # flag's contract is the key.
+  it "strips Sec-WebSocket-Extensions, keep_key or not" do
+    typed = ("GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" \
+             "Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n" \
+             "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n").to_slice
+    with_recording_origin do |port, head, _rx|
+      Gori::Repeater::WsEngine.send(typed, [] of Gori::Repeater::WsEngine::OutMsg,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+        idle: 100.milliseconds)
+      head.receive.should_not contain("Sec-WebSocket-Extensions")
+    end
+    with_recording_origin do |port, head, _rx|
+      Gori::Repeater::WsEngine.send(typed, [] of Gori::Repeater::WsEngine::OutMsg,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+        idle: 100.milliseconds, keep_key: true)
+      head.receive.should_not contain("Sec-WebSocket-Extensions")
+    end
+  end
+
   it "REPORTS a missing Sec-WebSocket-Accept instead of skipping the check" do
     # `return nil unless got` gave a server that upgraded with NO accept header the same
     # silence as one that answered correctly. The missing header IS the finding.

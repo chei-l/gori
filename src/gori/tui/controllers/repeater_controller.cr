@@ -2298,6 +2298,7 @@ module Gori::Tui
         @host.status("repeater already in flight…") unless quiet
         return false
       end
+      view.terminate_head_in_editor # the head terminator ^R adds, in the saved row too (headless sends the row as written)
       if view.ws_mode?
         send_ws_tab(tab)
         return true

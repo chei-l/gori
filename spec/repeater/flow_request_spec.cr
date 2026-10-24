@@ -1,11 +1,11 @@
 require "../spec_helper"
 
 # A `Store::FlowDetail` the way a proxy capture stores one.
-private def flow_detail(head : String, body : Bytes? = nil) : Gori::Store::FlowDetail
+private def flow_detail(head : String, body : Bytes? = nil, version : String = "HTTP/1.1") : Gori::Store::FlowDetail
   row = Gori::Store::FlowRow.new(
     id: 1_i64, created_at: 0_i64, scheme: "http", method: "GET", host: "h", port: 80,
     target: "/", status: 200, size: 0_i64, state: Gori::Store::FlowState::Complete)
-  Gori::Store::FlowDetail.new(row, "HTTP/1.1", head.to_slice, body, nil, nil)
+  Gori::Store::FlowDetail.new(row, version, head.to_slice, body, nil, nil)
 end
 
 describe Gori::Repeater::FlowRequest do
@@ -55,6 +55,12 @@ describe Gori::Repeater::FlowRequest do
         {"K" => "value-here"}, "$")
       out = String.new(Gori::Repeater::FlowRequest.resync_content_length(expanded))
       out.should contain("Content-Length: 10\r\n")
+    end
+
+    # Leading blank lines put the separator at offset 0: the real request is not a body.
+    it "adds nothing when no start line precedes the separator" do
+      wire = "\r\n\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n".to_slice
+      Gori::Repeater::FlowRequest.resync_content_length(wire).should eq(wire)
     end
 
     it "adds no header to a BODYLESS request (a GET with no Content-Length is untouched)" do
@@ -279,6 +285,19 @@ describe Gori::Repeater::FlowRequest do
   end
 
   # `gori run repeater <flow-id> -X` (#1384): the method, and nothing else, is replaced.
+  # gori's capture-only lines on a synthesized h2 head went on the wire as ordinary fields.
+  describe ".build — h2 capture markers" do
+    it "drops the trailer and push markers but keeps X-Gori-Protocol for the :protocol fold" do
+      head = "CONNECT /ws HTTP/2\r\nHost: h\r\nX-Gori-Trailers: grpc-status\r\n" \
+             "X-Gori-Pushed: server push promised on stream 1\r\nX-Gori-Protocol: websocket\r\n\r\n"
+      built = Gori::Repeater::FlowRequest.build(flow_detail(head, version: "HTTP/2"))
+      String.new(built.bytes).should eq("CONNECT /ws HTTP/2\r\nHost: h\r\nX-Gori-Protocol: websocket\r\n\r\n")
+      # An h1 capture is the client's own bytes.
+      h1 = Gori::Repeater::FlowRequest.build(flow_detail(head))
+      String.new(h1.bytes).should contain("X-Gori-Trailers")
+    end
+  end
+
   describe ".replace_method" do
     it "swaps the method and keeps the target, spacing, headers and body byte-exact" do
       wire = "GET  /a b\tHTTP/1.1\nHost: h\n\n".to_slice + Bytes[0xff]
@@ -423,6 +442,14 @@ describe Gori::Repeater::FlowRequest do
         .should eq("POST /u HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=B\r\n\r\n--B\r\nX: 1\r\n\r\nhi\r\n--B--\r\n")
     end
 
+    # A multibyte char in the head used to shift the CHAR-indexed split a byte early, so the
+    # head's own `\r\n` came back `\r\r\n`.
+    it "splits at the byte offset when the head carries a multibyte char" do
+      raw = "POST /u HTTP/1.1\r\nX-N: é\r\nContent-Type: multipart/form-data; boundary=B\r\n\r\n--B\nhi\n--B--\n".to_slice
+      String.new(Gori::Repeater::FlowRequest.normalize_multipart_body(raw))
+        .should eq("POST /u HTTP/1.1\r\nX-N: é\r\nContent-Type: multipart/form-data; boundary=B\r\n\r\n--B\r\nhi\r\n--B--\r\n")
+    end
+
     it "is idempotent on a body that already has CRLF" do
       raw = "POST /u HTTP/1.1\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\n\r\nhi\r\n--B--\r\n".to_slice
       Gori::Repeater::FlowRequest.normalize_multipart_body(raw).should eq(raw)
@@ -484,5 +511,23 @@ describe Gori::Repeater::FlowRequest do
       Gori::Repeater::FlowRequest.default_port("ftp").should eq(80)
       Gori::Repeater::FlowRequest.default_port("redis").should eq(80)
     end
+  end
+end
+
+describe "Gori::Repeater::FlowRequest.export_head" do
+  # A copied command that kept the capture's larger Content-Length waited on bytes never stored.
+  it "self-frames a capped request body over the stored bytes, and only then" do
+    req_head = "POST /big HTTP/1.1\r\nHost: e.test\r\nContent-Length: 9000\r\n\r\n"
+    resp_head = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"
+    row = Gori::Store::FlowRow.new(
+      id: 1_i64, created_at: 0_i64, scheme: "http", method: "POST", host: "e.test",
+      port: 80, target: "/big", status: 200, state: Gori::Store::FlowState::Complete,
+      size: 0_i64, response_size: 0_i64)
+    capped = Gori::Store::FlowDetail.new(row, "HTTP/1.1", req_head.to_slice, "short".to_slice,
+      resp_head.to_slice, "ok".to_slice, request_body_truncated: true)
+    String.new(Gori::Repeater::FlowRequest.export_head(capped)).should contain("Content-Length: 5\r\n")
+    whole = Gori::Store::FlowDetail.new(row, "HTTP/1.1", req_head.to_slice, "short".to_slice,
+      resp_head.to_slice, "ok".to_slice)
+    String.new(Gori::Repeater::FlowRequest.export_head(whole)).should eq(req_head)
   end
 end

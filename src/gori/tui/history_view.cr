@@ -2195,7 +2195,7 @@ module Gori::Tui
         return {"COPY AS", [] of CopyMenu::Option} unless d
         d, redacted_count = redacted(d, redactor)
         req = request_wire(d)
-        opts = CopyMenu.request_options(req, copy_target(d))
+        opts = CopyMenu.request_options(req, copy_target(d), code_wire: code_wire(d))
         # …plus the response, on the same 's' key the multi-flow set uses. Without it, marking a
         # SECOND flow would be the only way to reach the raw response, and the guide advertises
         # the format unconditionally. 's' rather than response_options' own keys because those
@@ -2206,7 +2206,8 @@ module Gori::Tui
         if pair = pair_option(d, req)
           opts << pair
         end
-        return {CopyMenu.sanitized_title("COPY REQUEST AS", redactor && redacted_count), opts}
+        title = CopyMenu.sanitized_title("COPY REQUEST AS", redactor && redacted_count)
+        return {CopyMenu.truncated_title(title, d.request_body_truncated?), opts}
       end
       # URLs and the host list need only the ROW, so read flow_row here — get_flow pulls the
       # full request+response bodies (2 MiB each), and ⇧T can hand this a full PAGE of marks.
@@ -2224,9 +2225,9 @@ module Gori::Tui
       # and not off `redactor`: a URL list that says SANITIZED would be claiming a profile ran
       # over something it never saw.
       bytes = rows.size <= COPY_BYTES_CAP ? byte_copy_options(store, ids, redactor) : nil
-      bytes.try { |(rows_opts, _)| opts.concat(rows_opts) }
-      {CopyMenu.sanitized_title("COPY #{rows.size} FLOWS AS",
-        redactor && bytes.try(&.[1])), opts}
+      bytes.try { |(rows_opts, _, _)| opts.concat(rows_opts) }
+      title = CopyMenu.sanitized_title("COPY #{rows.size} FLOWS AS", redactor && bytes.try(&.[1]))
+      {CopyMenu.truncated_title(title, bytes.try(&.[2])), opts}
     end
 
     # The detail a COPY works from: the captured one, or the sanitized derivative when this
@@ -2241,10 +2242,11 @@ module Gori::Tui
       {clean, report.count}
     end
 
-    # curl / raw-request / raw-response across the set. Only called within COPY_BYTES_CAP, so
+    # curl / raw-request / raw-response across the set, the redaction count, and whether any
+    # request body in it was cut at the capture cap. Only called within COPY_BYTES_CAP, so
     # this is the one place that loads N full details.
     private def byte_copy_options(store : Store, ids : Array(Int64),
-                                  redactor : Redact::Matcher?) : {Array(CopyMenu::Option), Int32}
+                                  redactor : Redact::Matcher?) : {Array(CopyMenu::Option), Int32, Bool}
       redacted_count = 0
       details = ids.compact_map do |id|
         d = store.get_flow(id) || next nil
@@ -2256,7 +2258,7 @@ module Gori::Tui
       # cURL comes from the SAME serialiser the single-flow path uses, via the narrow entry point
       # — request_options would allocate the headers/body/raw variants per flow too, several extra
       # copies of a multi-MiB body, for one line we keep.
-      curls = details.compact_map { |d| CopyMenu.curl_text(request_wire(d), copy_target(d)) }
+      curls = details.compact_map { |d| CopyMenu.curl_text(code_wire(d), copy_target(d)) }
       opts << CopyMenu::Option.new("cURL", 'l', curls.join("\n\n")) unless curls.empty?
       # A raw HTTP message contains blank lines, so joining on one would be ambiguous about
       # where a message ends — each gets a labelled separator line instead. The message bytes
@@ -2278,7 +2280,7 @@ module Gori::Tui
         "#{copy_separator(d.row)}\n#{body}"
       end
       opts << CopyMenu::Option.new("Req + Res pairs", 'p', pairs.join("\n\n")) unless pairs.empty?
-      {opts, redacted_count}
+      {opts, redacted_count, details.any?(&.request_body_truncated?)}
     end
 
     # The whole exchange — request, one blank line, response — both messages verbatim (P7).
@@ -2297,6 +2299,11 @@ module Gori::Tui
 
     private def request_wire(d : Store::FlowDetail) : String
       String.new(combine_bytes(d.request_head, d.request_body) || Bytes.empty)
+    end
+
+    # What the cURL / code rows serialize — see `CopyMenu.request_options`'s `code_wire`.
+    private def code_wire(d : Store::FlowDetail) : String
+      String.new(combine_bytes(Repeater::FlowRequest.export_head(d), d.request_body) || Bytes.empty)
     end
 
     private def copy_target(d : Store::FlowDetail) : String
@@ -2318,11 +2325,12 @@ module Gori::Tui
         wire = String.new(combine_bytes(detail.request_head, detail.request_body) || Bytes.empty)
         row = detail.row
         target = Repeater::FlowRequest.build_target(row.scheme, row.host, row.port)
-        opts = CopyMenu.request_options(wire, target)
+        opts = CopyMenu.request_options(wire, target, code_wire: code_wire(detail))
         if pair = pair_option(detail, wire)
           opts << pair
         end
-        {CopyMenu.sanitized_title("COPY REQUEST AS", marked), opts}
+        {CopyMenu.truncated_title(CopyMenu.sanitized_title("COPY REQUEST AS", marked),
+          detail.request_body_truncated?), opts}
       when :response
         head = detail.response_head
         opts = if head

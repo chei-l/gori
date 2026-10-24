@@ -971,7 +971,7 @@ module Gori
       # operator could not send an absent key, a short one, a non-base64 one, two of them, or
       # the same one twice — all handshake tests — and could not control header ORDER either,
       # because their line moved. `keep_key` is the opt-in: their block goes out as written,
-      # untouched, key line and position included. It is opt-in rather than the new default
+      # key line and position included — all but `Sec-WebSocket-Extensions` (see below). It is opt-in rather than the new default
       # because honouring the typed key also means `Sec-WebSocket-Accept` can no longer be
       # asserted (see `verify_accept`), and losing that check silently on every session would
       # trade one blind spot for another.
@@ -994,6 +994,9 @@ module Gori
         lines.skip(1).each do |line|
           next if line.empty?
           name = header_name(line)
+          # Stripped even under `keep_key`, whose contract is the KEY (every surface's help says
+          # so): gori does not decode permessage-deflate, and a Fuzzer would match compressed
+          # bytes as if they were the messages.
           next if name == "sec-websocket-extensions"
           if name == "sec-websocket-key"
             next unless keep_key

@@ -41,12 +41,25 @@ module Gori::Tui
       count ? "#{title} · SANITIZED (#{count})" : title
     end
 
+    # The picker heading for a request whose stored body was cut at the capture cap, so every
+    # row built from it (the cURL line, the five snippets, the raw request) carries the SHORT
+    # body. `gori run show --format curl|…` says so on stderr; the heading is this surface's
+    # place for it, for the reason `sanitized_title` puts its count there.
+    def self.truncated_title(title : String, truncated : Bool?) : String
+      truncated ? "#{title} · BODY TRUNCATED" : title
+    end
+
     # Options for a REQUEST pane. `wire` is the request as it'd be sent (CRLF-framed,
     # env-expanded — the bytes repeater uses), `target` the "scheme://host[:port]" base
     # that resolves an origin-form request line ("GET /p HTTP/1.1") into a full URL.
     # Empty formats (no body, no Cookie header) drop out so every row is meaningful.
+    #
+    # `code_wire` is what the cURL and code rows serialize when it differs from `wire`: a capped
+    # body re-framed over its stored bytes (`FlowRequest.export_head`), so a pasted command does
+    # not wait on bytes never stored, while the Raw row stays the capture.
     def self.request_options(wire : String, target : String, *,
-                             websocket_messages : Array(String)? = nil) : Array(Option)
+                             websocket_messages : Array(String)? = nil,
+                             code_wire : String? = nil) : Array(Option)
       head, body = split_message(wire)
       lines = split_lines(head)
       request_line = lines.first? || ""
@@ -79,7 +92,7 @@ module Gori::Tui
       # (a hand-authored Repeater line with no target base and no Host) has nothing runnable
       # either way, but the cURL row is where the reason is SAID — gating it on the guessed
       # URL dropped that comment exactly when the operator had the least to go on.
-      append_code_options(opts, wire, target) unless url.empty? && refusal.nil?
+      append_code_options(opts, code_wire || wire, target) unless url.empty? && refusal.nil?
       append_wscat_option(opts, derived_url, header_lines, websocket_messages)
       opts << Option.new("Raw request", 'r', wire) unless wire.strip.empty?
       opts

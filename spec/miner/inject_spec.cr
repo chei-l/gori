@@ -312,6 +312,12 @@ describe Gori::Miner::Inject do
     text(res).should eq("GET /a HTTP/1.1\r\nHost: h\r\n\r\n")
   end
 
+  # A mixed `\n\r\n` head splits on `\n`, so the CRLF Cookie line keeps its own CR.
+  it "keeps a CRLF Cookie line's terminator on a mixed head" do
+    res = M::Inject.apply(req("GET / HTTP/1.1\r\nCookie: a=b\r\nX: y\n\r\nBODY"), M::Location::Cookies, [{"zz", "1"}])
+    text(res).should eq("GET / HTTP/1.1\r\nCookie: a=b; zz=1\r\nX: y\n\r\nBODY")
+  end
+
   it "extends an existing Cookie header" do
     res = M::Inject.apply(req("GET /a HTTP/1.1\r\nHost: h\r\nCookie: s=1\r\n\r\n"), M::Location::Cookies, [{"p", "v"}])
     text(res).should contain("Cookie: s=1; p=v")
@@ -590,5 +596,18 @@ describe "Gori::Miner::Inject.existing_names" do
     base = req("POST /a HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\n" \
                "Content-Length: #{body.bytesize}\r\n\r\n#{body}")
     M::Inject.existing_names(base, M::Location::Json).should be_empty
+  end
+end
+
+# The head/body boundary is `Env.head_body_separator`'s, as on the send path: a local
+# LFLF/CRLFCRLF scan missed a `\n\r\n` terminator and read the whole request as head, so a
+# Headers candidate landed after the body and a Form candidate was never injected at all.
+describe "Gori::Miner::Inject on a mixed LF/CRLF head terminator" do
+  it "injects into the head and the body, keeping the separator bytes verbatim" do
+    base = "POST /a HTTP/1.1\nHost: h\nContent-Type: application/x-www-form-urlencoded\nContent-Length: 3\n\r\nx=1"
+    text(M::Inject.apply(req(base), M::Location::Headers, [{"X-P", "v"}])).should eq(
+      "POST /a HTTP/1.1\nHost: h\nContent-Type: application/x-www-form-urlencoded\nContent-Length: 3\nX-P: v\n\r\nx=1")
+    text(M::Inject.apply(req(base), M::Location::Form, [{"p", "v"}])).should eq(
+      "POST /a HTTP/1.1\nHost: h\nContent-Type: application/x-www-form-urlencoded\nContent-Length: 7\n\r\nx=1&p=v")
   end
 end
