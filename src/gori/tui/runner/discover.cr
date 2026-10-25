@@ -26,7 +26,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
       return
     end
     target = view.selected_endpoint(:container).try(&.[](:target)) || ep[:target]
-    open_discover_config(build_discover_seed(origin, ep[:host], target))
+    open_discover_config(build_discover_seed(origin, target))
   end
 
   # Marks (#442) enrich this WITHIN one host: the config popup's start-target list becomes the
@@ -48,18 +48,20 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
       @toast = ids.empty? ? "select a flow to discover" : "flow has no discoverable URL"
       return
     end
-    hosts = parsed.map { |(_, p)| p.host }.uniq!
+    # By ORIGIN, not host: h:8080 and h:9090 are two services, and merging them would
+    # seed the first one with the other's paths.
+    hosts = parsed.map { |(_, p)| Discover::Url.origin(p) }.uniq!
     if hosts.size > 1
       # Narrow to the PRIMARY target's host — the cursor row when it is itself a target, else the
       # oldest mark. Not `parsed.first`: that is display order, so which host survived would flip
       # with a history_list_order change, and the toast below promises the cursor row.
-      @toast = "marked flows span #{hosts.size} hosts — discover runs one host at a time"
+      @toast = "marked flows span #{hosts.size} origins — discover runs one origin at a time"
       primary = history_controller.primary_target_flow_id
       keep = parsed.find { |(id, _)| id == primary } || parsed.first
-      parsed = parsed.select { |(_, p)| p.host == keep[1].host }
+      parsed = parsed.select { |(_, p)| Discover::Url.origin(p) == Discover::Url.origin(keep[1]) }
     end
     donor_id, first = parsed.find { |(id, _)| id == history_controller.primary_target_flow_id } || parsed.first
-    open_discover_config(build_discover_seed(Discover::Url.origin(first), first.host,
+    open_discover_config(build_discover_seed(Discover::Url.origin(first),
       parsed.map { |(_, p)| p.path }))
     # One donor for the reused auth/cookie headers — the confirm is nested over the config
     # popup and can't loop, so the first marked flow supplies them. This is the only full

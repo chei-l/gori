@@ -179,6 +179,23 @@ describe Gori::Tui::TrafficEmptyState do
     # a card wearing its container's name reads as a rendering fault rather than as a hint.
     backend.contains?("FUZZ RUN").should be_true
     backend.contains?("^R").should be_true
+    # The card does not know whether the tab has sets, so it never orders "add sets, then".
+    backend.contains?("Add payload sets").should be_false
+  end
+
+  it "resolves the idle fuzzer card's run key from the keymap" do
+    prev = TrafficEmptyState.registry
+    previous = Gori::Settings.keymap_overrides
+    begin
+      TrafficEmptyState.registry = Gori::Verbs.registry
+      Gori::Settings.keymap_overrides = {"fuzz.run" => ["alt-r"]}
+      backend = MemoryBackend.new(70, 10)
+      TrafficEmptyState.render(Screen.new(backend), Rect.new(0, 0, 70, 10), variant: :fuzzer_results, running: false)
+      backend.contains?("Press ⌥R to start a fuzz run").should be_true
+    ensure
+      TrafficEmptyState.registry = prev
+      Gori::Settings.keymap_overrides = previous
+    end
   end
 
   it "renders the probe scan card when scanning is on" do
@@ -270,6 +287,20 @@ describe Gori::Tui::TrafficEmptyState do
     backend.contains?("DISCOVER").should be_true
     backend.contains?("crawl").should be_true
     backend.contains?("Discover here").should be_true
+  end
+
+  # The menu-only chip is `Hotkeys.menu_chip`'s spelling, never the arrowless ` space > D `.
+  it "spells the discover card's menu chip the shared way" do
+    prev = TrafficEmptyState.registry
+    begin
+      TrafficEmptyState.registry = Gori::Verbs.registry
+      backend = MemoryBackend.new(60, 12)
+      TrafficEmptyState.render(Screen.new(backend), Rect.new(0, 0, 60, 12), variant: :discover)
+      backend.contains?(" #{Gori::Hotkeys.menu_chip(Gori::Verbs.registry, "sitemap.discover")} ").should be_true
+      backend.contains?(" space ").should be_false
+    ensure
+      TrafficEmptyState.registry = prev
+    end
   end
 
   # The cards' chord chips are literals until the Runner hands the module a registry; with

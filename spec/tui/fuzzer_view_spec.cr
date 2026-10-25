@@ -215,6 +215,20 @@ describe Gori::Tui::FuzzerView do
     end
   end
 
+  # `fuzz.sort` is a menu row with no chord: bare `o` in RESULTS is unbound.
+  it "names the sort chip's menu route when it has no chord" do
+    view = loaded_fuzzer
+    view.set_registry(Gori::Verbs.registry)
+    view.append_result(fuzz_result(0, 200, 10))
+    view.focus_pane(:results)
+    rect = Rect.new(0, 0, 120, 34)
+    backend = MemoryBackend.new(rect.w, rect.h)
+    view.render(Screen.new(backend), rect)
+    chip = Gori::Hotkeys.menu_chip(Gori::Verbs.registry, "fuzz.sort")
+    backend.contains?("#{chip}:index").should be_true
+    backend.contains?(" o:index").should be_false
+  end
+
   describe "decoded response detail" do
     it "shows a gzip response as its decoded entity without changing retained evidence" do
       plain = %({"decoded_response":true})
@@ -1587,6 +1601,24 @@ describe "FuzzerView TEMPLATE editor parity with the Repeater request editor" do
     before = view.template_text
     10.times { view.template_undo } # empty stack — no crash, no change
     view.template_text.should eq(before)
+  end
+
+  it "^K and ^A are undoable and leave the caret where it was" do
+    view = FuzzerView.new
+    view.load_request("https://h", "GET /?x=1 HTTP/1.1\r\nHost: h\r\n\r\n", false, "")
+    view.focus_pane(:template)
+    view.enter_template_insert!
+    view.template_move(1, 0)
+    view.template_end # after `h`, on the Host line
+    view.mark_word.should eq("marked position")
+    view.template_insert('X') # lands where the caret stayed: inside the new marker, line 2
+    view.template_text.split("\r\n")[1].should eq("Host: §hX§")
+    view.template_undo
+    view.template_undo
+    view.template_text.should eq("GET /?x=1 HTTP/1.1\r\nHost: h\r\n\r\n")
+    view.auto_mark.should contain("auto-marked")
+    view.template_undo
+    view.template_text.should eq("GET /?x=1 HTTP/1.1\r\nHost: h\r\n\r\n")
   end
 
   it "⇧arrows extend a selection that ⌫ then removes in one step" do

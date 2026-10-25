@@ -470,6 +470,13 @@ module Gori::Tui
       end
     end
 
+    # What to change after a failed bind. A hostname that does not resolve fails with the
+    # stdlib's `Socket::Addrinfo::Error` ("Hostname lookup for … failed"), and telling that
+    # operator to pick a free port sends them to the wrong field.
+    def self.bind_fix(err : String) : String
+      err.starts_with?("Hostname lookup") ? "set a Listen IP that resolves" : "set a free port"
+    end
+
     def run : Symbol
       # The fiber that runs the event loop: a session slot's before-send refresh asked from it
       # runs in the background instead of blocking the loop on a login (#1233).
@@ -489,8 +496,9 @@ module Gori::Tui
       if err = @session.bind_error
         @toast =
           if @session.capturing_lock_held?
-            # We own this project's capture but the bind failed (port taken).
-            "capture OFF — #{err}. History/Repeater work; set a free port in settings (^P) then press c"
+            # We own this project's capture but the bind failed: the port is taken, or the
+            # Listen IP does not resolve (`bind_host_error` allows a hostname by design).
+            "capture OFF — #{err}. History/Repeater work; #{Runner.bind_fix(err)} in settings (^P) then press c"
           else
             # View-only: another live instance owns this project's capture.
             "view-only — #{err}. History/Repeater work; press c to take over if it closed"
@@ -682,6 +690,13 @@ module Gori::Tui
               # chip too. Reports dirty only when the rendered chip string actually changed, so an
               # idle project with a steady agent list does not repaint on the timer.
               dirty = true if refresh_agent_presence
+              # A peer's `gori run project rename` writes a sidecar file, not the DB, so it is
+              # polled here beside the other filesystem-side scans: the header, the terminal
+              # title and the Project card's Name row all read `@session.project`.
+              if @session.refresh_project_name
+                project_controller.view.project = @session.project
+                dirty = true
+              end
               # Courier replies to the lines `app.tell-agent` posted (#1090). Beside the presence
               # scan and OUTSIDE the data_version branch for a different reason than it: the
               # cursor is what makes this idempotent, so the DB-version gate buys nothing, and it
@@ -1265,6 +1280,7 @@ module Gori::Tui
     # store-backed views. Active-tab reloads use id/path soft-anchors; Repeater/Notes
     # soft-merge and skip dirty buffers so session UI is not clobbered.
     private def apply_external_change : Nil
+      @tabs[@active_tab]?.try(&.before_external_change)
       refresh_evidence_availability
       # Scope has no dirty-edit-buffer concept to protect (add/remove/toggle write straight
       # through to the store), so it's always safe to refresh in place here — unlike a
@@ -1295,12 +1311,9 @@ module Gori::Tui
       # of the session — every Repeater/Fuzzer/Miner/Intercept send expanded the value this
       # process happened to open with.
       #
-      # The extra reason is that the Project tab's ENV pane read-modify-WRITES the whole array
-      # (`Env.save_project` persists it wholesale, from the copy `ProjectView#reload` took of
-      # this global), so a stale copy did not just READ wrong — the next edit in the pane wrote
-      # the stale set back and silently DELETED every var the other process had added. MCP
-      # states exactly this hazard as the reason it refreshes per call (see
-      # `MCP::Tools::ENV_REFRESH_TOOLS`); this surface is the one that had no refresh at all.
+      # The Project tab's ENV pane also DRAWS from a copy of this global (it writes one key per
+      # edit through `Env.mutate_project`, so the store is safe either way), and a stale copy
+      # is a list showing vars that are gone.
       #
       # Safe in place, like the two above: the pane's inline add/edit row is a separate buffer,
       # and re-seeding the list around it is `ProjectView#reload_env_vars`' business — it
@@ -2734,15 +2747,23 @@ module Gori::Tui
       true
     end
 
+    # A pasted ↵ would run the top match, and the rest of the clipboard would then type into
+    # whatever that verb opened: held back the way a modal's is (`Overlay#takes_pasted?`).
+    private def palette_enter(ev : Termisu::Event::Key) : Nil
+      if @paste_newline.pasting?
+        refuse_modal_paste(ev)
+      elsif verb = @palette.selected_verb
+        run_palette_verb(verb)
+      end
+    end
+
     private def handle_palette_key(ev : Termisu::Event::Key) : Nil
       key = ev.key
       c = ev.char || key.to_char
       if key.escape?
         close_overlay
       elsif key.enter?
-        if verb = @palette.selected_verb
-          run_palette_verb(verb)
-        end
+        palette_enter(ev)
       elsif @palette.edit(ev, self) # ↑/↓, ⌃/⌥←→, Home/End, Delete, ⌥⌫, ←/→ — before ⌫ and the printables
       elsif key.backspace?
         @palette.backspace(self)
@@ -3138,6 +3159,7 @@ module Gori::Tui
     private def render_prompts(screen : Screen, layout : Layout) : Nil
       @copy_picker.try(&.render(screen, layout.body)) if copy_as_shown?
       @send_picker.try(&.render(screen, layout.body)) if send_to_shown?
+      close_space_menu_moved_under
       @space_menu.render(screen, layout.body) if @space_menu_open
       render_goto_prompt(screen, layout.status) if @goto_open
       render_search_prompt(screen, layout.status) if @search_open
@@ -4131,7 +4153,8 @@ module Gori::Tui
       borrowed = !Settings.mouse
       @term.enable_mouse if borrowed
       begin
-        Tutorial.new(@term, Tutorial::Handoff::Session, @session.registry).run
+        Tutorial.new(@term, Tutorial::Handoff::Session, @session.registry,
+          proxy: {@session.proxy.host, @session.proxy.port}).run
       ensure
         @term.disable_mouse if borrowed
       end
@@ -4431,6 +4454,18 @@ module Gori::Tui
     private def close_space_menu : Nil
       @space_menu_open = false
       @space_menu_here = nil
+    end
+
+    # The card lists the pane it was opened on. A frame can move focus under it — a resize
+    # that hides the Repeater's request column settles focus on TARGET (#1421,
+    # `RepeaterView#settle_focus_on_drawn_pane`) — and a row picked then would run against
+    # the new pane while the card still says the old one. Run after the body drew, so the
+    # focus it compares is this frame's.
+    private def close_space_menu_moved_under : Nil
+      return unless @space_menu_open && (was = @space_menu_here)
+      return if was.section == focused_section
+      close_space_menu
+      @toast = "menu closed — focus moved to another pane"
     end
 
     private def open_goto(target : Symbol) : Nil
@@ -5430,25 +5465,13 @@ module Gori::Tui
 
     # Candidate start targets for the Discover popup: the path subtree first (the likely
     # intent), then the whole host — so `/notes` offers both `/notes/` and `/`.
-    private def build_discover_seed(origin : String, host : String, path : String) : DiscoverSeed
-      build_discover_seed(origin, host, [path])
+    private def build_discover_seed(origin : String, path : String) : DiscoverSeed
+      build_discover_seed(origin, [path])
     end
 
-    # `paths` is one path from the Sitemap/single-flow entry points, or every marked flow's
-    # path when the History list has a mark set on ONE host (#442) — so marking five endpoints
-    # turns the popup's start-target list into a pick among exactly those five. The host root
-    # is always offered last. Duplicates collapse; order follows the paths given.
-    private def build_discover_seed(origin : String, host : String, paths : Array(String)) : DiscoverSeed
-      choices = [] of {String, String}
-      paths.each do |path|
-        clean = path.partition('?')[0]
-        next if clean.empty? || clean == "/"
-        sub = clean.ends_with?('/') ? clean : "#{clean}/"
-        next if choices.any? { |(label, _)| label == sub }
-        choices << {sub, "#{origin}#{sub}"}
-      end
-      choices << {"/", "#{origin}/"}
-      DiscoverSeed.new(choices, host)
+    # See `DiscoverSeed.build`.
+    private def build_discover_seed(origin : String, paths : Array(String)) : DiscoverSeed
+      DiscoverSeed.build(origin, paths)
     end
 
     # After the config popup opens on a History flow, offer to reuse that flow's own

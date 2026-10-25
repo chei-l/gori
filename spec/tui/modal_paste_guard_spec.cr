@@ -90,3 +90,14 @@ describe "Runner — the rest of a paste after a refusal" do
     body.should contain("body_takes_text?")
   end
 end
+
+describe "Runner — a paste into the Ctrl-P palette" do
+  it "holds back a pasted line break instead of running the top match" do
+    runner_body("private def handle_palette_key(ev : Termisu::Event::Key) : Nil").should contain("palette_enter(ev)")
+    body = runner_body("private def palette_enter(ev : Termisu::Event::Key) : Nil")
+    guard = body.match(/if @paste_newline\.pasting\?\n(.*?)\n/)
+    guard.should_not be_nil
+    guard.not_nil![1].should contain("refuse_modal_paste(ev)")
+    body.index!("@paste_newline.pasting?").should be < body.index!("run_palette_verb")
+  end
+end

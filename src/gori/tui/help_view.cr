@@ -129,7 +129,7 @@ module Gori::Tui
         # literal character (and typing it over a selection REPLACES it), so INS gets the
         # ctrl form. The key column resolves `y` from the verb id; `^Y` is its second chord.
         Item.new("y · ^Y", "copy selection/line — `y` in READ, ^Y in INS too", "repeater.copy"),
-        Item.new("x · ⇧arrows", "select the current line · extend selection"),
+        Item.new("{repeater.select-line} · ⇧arrows", "select the current line · extend selection"),
         # The §…§ marker trio, same keys and same order as the FUZZER section below — the
         # Repeater grew `^K`/`^T` to match and Help documented neither.
         Item.new("{repeater.auto-mark} · {repeater.mark-word} · {repeater.toggle-decoded}", "auto-mark params · mark word · mark point (manual §)"),
@@ -323,11 +323,9 @@ module Gori::Tui
         # No pane inventory: the chip strip names all six on screen, no sibling row lists sub-panes,
         # and the parenthetical was what pushed this row past `HelpPopupOverlay::MAX_W` when the
         # sixth pane arrived — it would have broken again at the seventh. Keys only, like the rest.
-        # `x line · y copy` stay LITERAL here, unlike the sibling rows above: the description
-        # pane dispatches both raw (`ProjectController#handle_desc_read`), and the matching
-        # verbs carry no bare chord to read — `project.select-line` has none at all and
-        # `project.copy` is `^Y` only — so a token would resolve to the wrong key or to none.
-        Item.new("Project", "←/→ sub-tab · ↓/↵ enter · desc: i/↵ edit · x line · y copy · space cmds"),
+        # Tokens, like the Notes row: the description pane defers both keys to the keymap
+        # (`ProjectController#handle_desc_read`), and the vim keyset respells select-line.
+        Item.new("Project", "←/→ sub-tab · ↓/↵ enter · desc: i/↵ edit · {project.select-line} line · {project.copy} copy · space cmds"),
         # ACTIVITY is a Project sub-tab, so its keys hang off the row above rather than earning
         # a section — but `⇧X` there deletes the durable audit trail, which is the one key on
         # this tab that must be named somewhere the operator can read before pressing it.
@@ -354,7 +352,9 @@ module Gori::Tui
         Item.new("{space:rewriter.scope} · {space:rewriter.toggle-default}", "move the rule global ⇄ project · flip a global rule's default everywhere"),
         Item.new("G / P column", "global (every project) or project · G* = this project overrides its default"),
         Item.new("{rewriter.move-down} / {rewriter.move-up}", "reorder within a scope — globals apply first, then project rules"),
-        Item.new("[ / ]", "switch sub-tab: rules · extract · bindings"),
+        # ↹, not `[ / ]`: those are the global next/prev TAB (`nav.next-tab`), and this tab's
+        # sub-tabs ride the focus ring (`RewriterController#pane_advance`).
+        Item.new("↹ / ⇧↹", "switch sub-tab: rules · extract · bindings"),
         Item.new("↓ past the list", "the editable preview sample, and the same message after the rules run"),
         # NOT "y copies the OUTPUT · ^Y copies the INPUT": `rewriter.copy` is ONE verb with two
         # chords, and `rewriter_copy` branches on the FOCUSED PANE, not on which chord fired —
@@ -368,7 +368,8 @@ module Gori::Tui
         Item.new("{space:colormarker.scope} · {space:colormarker.toggle-default}", "move the rule global ⇄ project · flip a global rule's default everywhere"),
         Item.new("{colormarker.move-down} / {colormarker.move-up}", "reorder — the FIRST enabled match paints the row, the rest are skipped"),
         Item.new("style", "full = tint the whole row · strip = one colour cell ahead of TIME"),
-        Item.new("when:", "host: path: method: scheme: status: proto: — ↹ completes · no header:/size:/dur:"),
+        # Full History QL (`Colormarker`'s two tiers): `header:`/`size:`/`dur:`/`body:` work too.
+        Item.new("when:", "History QL — host: path: status: header: size: dur: … · ↹ completes"),
         Item.new("↹ · ↓ past list", "CUSTOM COLORS pane — a add · ↵/e edit · d delete (name + #hex)"),
         Item.new("custom colour", "a global name the picker offers everywhere; its hex is absolute, not theme-relative"),
         Item.new("off the bar by default", "`0` opens it; settings:tabs gives it a slot, next to Rewriter"),

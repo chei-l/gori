@@ -31,8 +31,6 @@ module Gori::Tui
       # Which findings row each buffered pair came from, same order as @persist_buf, so the
       # ids the batch returns can be handed back to the rows that will open them.
       @persist_owners = [] of {DiscoverRun, Int32}
-      @persist_base = Time.utc.to_unix * 1_000_000
-      @persist_seq = 0_i64
       @run_seq = 0
     end
 
@@ -397,7 +395,7 @@ module Gori::Tui
         # lives on the main fiber: this event IS the finish, so there is nothing local to clear.
         events.send({run, Discover::ErrorEvent.new("#{ex.class}: #{ex.message}")}) unless terminal_sent
       end
-      @host.status("discovering #{run.target} in the background — watch the bottom bar / notifications")
+      @host.status("discovering #{run.target} in the background#{scope_note(run)} — watch the bottom bar / notifications")
     end
 
     # View state → Discover::PlanOptions → the ONE builder every surface shares. The run's
@@ -426,7 +424,9 @@ module Gori::Tui
       end
       options = Discover::PlanOptions.new(run.target, config: run.config,
         verify: !session.config.insecure_upstream?, overrides: session.host_overrides)
-      {Discover::Plan.build(options, Gori::Outbound.interactive(session.scope)).engine, nil}
+      plan = Discover::Plan.build(options, Gori::Outbound.interactive(session.scope))
+      run.outside_scope = plan.seed_outside_scope?
+      {plan.engine, nil}
     rescue ex : Discover::PlanError
       {nil, discover_plan_error(ex)}
     rescue ex
@@ -517,13 +517,19 @@ module Gori::Tui
              elsif ev.budget_exhausted
                " — budget exhausted, #{ev.progress.queued} queued unexplored (raise max requests to finish)"
              else
-               ""
+               scope_note(run)
              end
       msg = "Discover: #{Gori.plural(n, "endpoint")} on #{run.target}#{tail}"
       level = n > 0 ? :success : :info
       log_event(run, level, msg)
       push_notification(run, level, msg)
       @host.status(msg) if Settings.notify_toast?
+    end
+
+    # The include boundary binds whether or not the scope lens is on (`Discover::Plan`), so a
+    # seed outside it ends the crawl at the seed: say so instead of a bare "done".
+    private def scope_note(run : DiscoverRun) : String
+      run.outside_scope? ? " — the seed is outside the scope rules, so links outside them are not followed" : ""
     end
 
     private def push_notification(run : DiscoverRun, level : Symbol, msg : String) : Nil
@@ -542,8 +548,7 @@ module Gori::Tui
     # store). That is what lets a long crawl retain nothing per finding but its row.
     private def queue_persist(run : DiscoverRun, idx : Int32, f : Discover::Finding,
                               exchange : Discover::Exchange?) : Nil
-      @persist_seq += 1
-      pair = Discover::Persist.flow_pair(f, @persist_base + @persist_seq, exchange,
+      pair = Discover::Persist.flow_pair(f, run.persist_base + idx + 1, exchange,
         surface: Gori::FlowSource::Surface::Tui)
       @persist_buf << {pair.request, pair.response}
       @persist_owners << {run, idx}

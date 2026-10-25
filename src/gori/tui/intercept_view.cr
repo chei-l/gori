@@ -106,8 +106,10 @@ module Gori::Tui
       @host_suggest_values = [] of String
       # The `↓` completion dropdown. Closed until asked for — see `SuggestPopup`.
       @popup = SuggestPopup.new
-      @loaded_id = nil.as(Int64?) # which item the editor currently holds
-      @editor_dirty = false       # whether the held bytes were actually edited (vs just viewed)
+      @loaded_id = nil.as(Int64?)     # which item the editor currently holds
+      @editor_dirty = false           # whether the held bytes were actually edited (vs just viewed)
+      @discard_armed = nil.as(Int64?) # the item a refused open will, on a second press, discard the edit for
+      @edit_notice = nil.as(String?)
       # Whether the LOADED item is a WebSocket message. Captured when the editor takes the
       # bytes rather than looked up per call: `pending_edit` must know before it touches the
       # buffer, and by then the item can already have left the queue (forwarded cross-process
@@ -275,7 +277,8 @@ module Gori::Tui
     def move(delta : Int32) : Nil
       return if @items.empty? || @editing
       @selected = (@selected + delta).clamp(0, @items.size - 1)
-      @marks.reset_anchor # a plain move re-seeds the range anchor, like a GUI list
+      @marks.reset_anchor  # a plain move re-seeds the range anchor, like a GUI list
+      @discard_armed = nil # a discard is armed for the row the refusal was on, not a later visit
     end
 
     # At the first (top) queue item (and not editing) — lets the Runner pop focus
@@ -426,16 +429,42 @@ module Gori::Tui
     #
     # `insert` picks the text editor's mode: ↵/`e` on the queue ask to edit and land in INS,
     # Tab into the pane lands in READ, where a typed `i` is the way in rather than a byte.
+    #
+    # Loading a DIFFERENT item replaces the one buffer, so an edit not yet forwarded would go
+    # with no word. The first press is refused; a second on the same row, with the cursor not
+    # moved in between, discards that edit and opens this one. Each says so (`take_edit_notice`).
     def toggle_edit(insert : Bool = true) : Nil
       if @editing
         @editing = false
       elsif it = selected_item
+        return if keep_other_edit?(it)
+        @discard_armed = nil
         it.binary? ? load_hex(it) : load_text(it)
         @loaded_id = it.id
         @loaded_ws = it.kind.ws?
         @editing = true
         @insert = insert
       end
+    end
+
+    # Whether opening `it` is refused to keep another held item's unforwarded edit; on the
+    # armed second press it is not, and the edit is discarded. Either way `@edit_notice` says so.
+    private def keep_other_edit?(it : Interceptor::Item) : Bool
+      return false unless other = held_edit_id.try { |id| @items.find { |o| o.id == id && id != it.id } }
+      if @discard_armed != it.id
+        @discard_armed = it.id
+        @edit_notice = "#{other.label} has an edit not forwarded yet — forward it first, or open this one again to discard that edit"
+        return true
+      end
+      @edit_notice = "discarded the unforwarded edit on #{other.label}"
+      false
+    end
+
+    # What the last `toggle_edit` did to another item's unforwarded edit (kept it and refused, or
+    # discarded it), or nil; reading clears it.
+    def take_edit_notice : String?
+      notice, @edit_notice = @edit_notice, nil
+      notice
     end
 
     def text_insert? : Bool
@@ -976,7 +1005,8 @@ module Gori::Tui
     def select_index(idx : Int32) : Nil
       return if @items.empty?
       @selected = idx.clamp(0, @items.size - 1)
-      @marks.reset_anchor # same as the keyboard `move`: a plain click re-seeds the anchor
+      @marks.reset_anchor  # same as the keyboard `move`: a plain click re-seeds the anchor
+      @discard_armed = nil # a discard is armed for the row the refusal was on, not a later visit
     end
 
     # Click the queue list → focus the list (stop editing the detail editor).
@@ -1207,7 +1237,7 @@ module Gori::Tui
       method, raw_target = effective_method_target(it) # edited values for the loaded item
       case it.kind
       in .request?, .response? then it.label(method, raw_target)
-      in .ws_out?, .ws_in?     then "#{it.host}#{Url.origin_path(raw_target)}  #{ws_preview(it)}"
+      in .ws_out?, .ws_in?     then "#{it.authority}#{Url.origin_path(raw_target)}  #{ws_preview(it)}"
       end
     end
 

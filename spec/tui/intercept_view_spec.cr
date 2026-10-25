@@ -1094,6 +1094,8 @@ describe "Intercept verbs (P1)" do
         view.stop_edit
         view.move(1) # onto the text hold
         view.toggle_edit
+        view.take_edit_notice.not_nil!.should contain("not forwarded yet") # the hex edit is not forwarded: the first open asks
+        view.toggle_edit
         view.hex_editing?.should be_false
         view.text_editing?.should be_true
         view.forward_bytes(txt).should eq(%({"a":1}).to_slice) # unedited: byte-exact
@@ -1271,6 +1273,37 @@ describe "Intercept operator-edit flag" do
     end
   end
 
+  # Opening a second hold replaced the one buffer, so the first hold's edit vanished with no
+  # word. The first open is refused; a second open of the same row discards that edit.
+  it "refuses once before another hold's open discards an unforwarded edit" do
+    tmp_interceptor do |ic|
+      three_holds(ic)
+      view = InterceptView.new
+      view.reload(ic)
+      first = view.selected_id.not_nil!
+      view.toggle_edit
+      view.edit_insert('X')
+      view.stop_edit
+
+      view.move(1)
+      view.toggle_edit
+      view.take_edit_notice.not_nil!.should contain("not forwarded yet")
+      view.editing?.should be_false
+      view.held_edit_id.should eq(first)
+
+      # Moving away disarms it: a later visit asks again rather than discarding unseen.
+      view.move(1)
+      view.move(-1)
+      view.toggle_edit
+      view.take_edit_notice.not_nil!.should contain("not forwarded yet")
+
+      view.toggle_edit
+      view.take_edit_notice.not_nil!.should start_with("discarded the unforwarded edit on ")
+      view.editing?.should be_true
+      view.held_edit_id.should be_nil
+    end
+  end
+
   # `@loaded_id`/`@editor_dirty` used to survive behind a CLOSED editor, so a buffer for a
   # message that no longer exists outlived every release and this flag would have named it.
   it "forgets the edit once the hold leaves the queue" do
@@ -1374,5 +1407,14 @@ describe "Gori::Interceptor#drain_notices" do
       ic.drain_notices.size.should eq(Gori::Interceptor::NOTICE_CAP)
       ic.drain_notices.should be_empty
     end
+  end
+end
+
+# Turning catch off said an open editor's changes were NOT applied even when nothing was edited.
+describe "Intercept toggle-off toast" do
+  it "warns about dropped editor changes only when there was an edit" do
+    r = Gori::Interceptor::ToggleResult.new(false, 2)
+    InterceptController.toggle_status(r, false).should eq("intercept off — auto-forwarded 2 held messages")
+    InterceptController.toggle_status(r, true).should contain("NOT applied")
   end
 end

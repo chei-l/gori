@@ -72,6 +72,7 @@ module Gori::Tui
       @current = 0
       @next_id = 2_i64
       @dirty = false
+      @cur_moved = false            # the active note changed since the last save (not an edit: see `switch_note`)
       @link_preview = ""            # resolved first-link line for the bottom strip (set by controller)
       @deleted_ids = Set(Int64).new # notes closed this session — so a merge-on-save doesn't resurrect them
       # Ids this session MINTED that no committed document has carried yet. A note in here
@@ -557,13 +558,13 @@ module Gori::Tui
       closed_id
     end
 
-    # Switch to note `idx` (no-op if out of range or already current). Marks dirty
-    # so the active tab is remembered across reloads.
+    # Switch to note `idx` (no-op if out of range or already current). NOT an edit: `@dirty`
+    # blocks `reload`, so marking it here left a peer's creates and deletes unseen until the
+    # tab was left. A reload keeps the active note by id (`soft_merge_from`) anyway.
     def switch_note(idx : Int32) : Nil
       return unless 0 <= idx < @notes.size
-      return if idx == @current
+      @cur_moved = true unless idx == @current # …but the next save still records which note is open
       @current = idx
-      @dirty = true
     end
 
     # Switch to the note with stable id `id` (create-and-link "open" path).
@@ -588,7 +589,7 @@ module Gori::Tui
     # buffer still matches its baseline is not ours to write: the persisted copy (a peer's
     # edit, or a peer's delete) stands.
     def save(store : Store) : Bool
-      return true unless @dirty
+      return true unless @dirty || @cur_moved
       mine = [] of Notes::NoteEntry
       @notes.each do |n|
         text = n.area.text
@@ -618,6 +619,7 @@ module Gori::Tui
       # the only thing that would have made a later exit path try again. Same correction as
       # `ProjectView#save`.
       @dirty = false
+      @cur_moved = false
       true
     end
 

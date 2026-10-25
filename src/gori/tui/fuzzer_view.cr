@@ -151,6 +151,12 @@ module Gori::Tui
       @registry.try { |r| Hotkeys.binding_label(r, id, fallback) } || fallback
     end
 
+    # The RESULTS sort chip's key. `fuzz.sort` has no chord by default (bare `o` is unbound,
+    # it is a menu row), so the chip names the menu route unless the operator bound one.
+    private def sort_key_label : String
+      key_label("fuzz.sort", Hotkeys.menu_chip(@registry, "fuzz.sort"))
+    end
+
     PANE_ORDER = [:target, :template, :config, :results]
 
     def initialize(@result_window : FuzzerResultWindow = FuzzerResultWindow.new)
@@ -815,7 +821,7 @@ module Gori::Tui
         return "§ here is literal (escaped §§) — auto-mark won't add positions; ^K marks the token at the cursor" if Fuzz::Template.marker_bytes_in?(before.to_slice)
         return "nothing to auto-mark — no query, cookie or body values found"
       end
-      @editor.set_text_keeping_eols(text)
+      @editor.remark_keeping_eols(text)
       @dirty = true
       n = Fuzz::Template.parse(text).position_count
       "auto-marked #{Gori.plural(n, "position")}"
@@ -865,7 +871,7 @@ module Gori::Tui
       before = @editor.text
       after = Fuzz::Template.mark_word(before, @editor.cursor_offset)
       return "no word at the cursor — place it on a token (or ^A to auto-mark)" if after == before
-      @editor.set_text_keeping_eols(after)
+      @editor.remark_keeping_eols(after)
       @dirty = true
       Fuzz::Template.parse(after).position_count < Fuzz::Template.parse(before).position_count ? "unmarked position" : "marked position"
     end
@@ -891,7 +897,7 @@ module Gori::Tui
     def clear_marks : String
       # clear_markers renders the defaults inline — drops both the § delimiters AND any
       # ¦chain (a naive gsub("§","") would leave a stray value¦chain behind).
-      @editor.set_text_keeping_eols(Fuzz::Template.clear_markers(@editor.text))
+      @editor.remark_keeping_eols(Fuzz::Template.clear_markers(@editor.text))
       @dirty = true
       "cleared all § markers"
     end
@@ -1759,7 +1765,7 @@ module Gori::Tui
     #     has none), the body is copied through byte-for-byte, and no `$` is touched.
     #
     # Provenance is about where the bytes CAME FROM, so an operator edit does not clear it:
-    # ^A/^K only insert §/¦ within a line (`set_text_keeping_eols` keeps every terminator), and
+    # ^A/^K only insert §/¦ within a line (`remark_keeping_eols` keeps every terminator), and
     # dropping evidence on the first keystroke would put the substitution back on the most
     # common workflow there is — seed a capture, tweak a header, mark, run.
     #
@@ -3365,7 +3371,7 @@ module Gori::Tui
       rx = Frame.toggle_badge(screen, rx, rect.y, min_x,
         key_label("fuzz.matched", "m"), "MATCH", @matched_only)
       Frame.toggle_badge(screen, rx, rect.y, min_x,
-        key_label("fuzz.sort", "o"), sort_chip, false) # sort: a value chip, never lit
+        sort_key_label, sort_chip, false) # sort: a value chip, never lit
       inner = rect.inset(1, 1)
       view = sorted_results
       @sel = @sel.clamp(0, {view.size - 1, 0}.max)
@@ -4242,7 +4248,7 @@ module Gori::Tui
       Frame.right_badge_hit(mx, my, pane.y, pane.right - 1, min_x, [
         {:dist, key_label("fuzz.dist", "v"), "DIST"},
         {:match, key_label("fuzz.matched", "m"), "MATCH"},
-        {:sort, key_label("fuzz.sort", "o"), sort_chip},
+        {:sort, sort_key_label, sort_chip},
       ] of {Symbol, String, String})
     end
 

@@ -484,6 +484,48 @@ describe Gori::Tui::NotesView do
     end
   end
 
+  # A switch is not an edit: `dirty?` blocks `reload`, so marking it hid a peer's new note
+  # until the operator left the tab.
+  it "still takes a peer's new note after a sub-tab switch" do
+    with_store do |store|
+      view = NotesView.new
+      view.reload(store)
+      type(view, "one")
+      view.new_note
+      type(view, "two")
+      view.save(store).should be_true
+      view.switch_note(0)
+      view.dirty?.should be_false
+
+      peer = NotesView.new
+      peer.reload(store)
+      peer.new_note
+      peer.replace_current("peer")
+      peer.save(store).should be_true
+
+      view.reload(store)
+      view.count.should eq(3)
+      view.current_text.should eq("one") # still on the note the operator switched to
+    end
+  end
+
+  it "records the note switched to on the next save, so a reopen lands on it" do
+    with_store do |store|
+      view = NotesView.new
+      view.reload(store)
+      type(view, "one")
+      view.new_note
+      type(view, "two")
+      view.save(store).should be_true
+      view.switch_note(0)
+      view.save(store).should be_true
+
+      reopened = NotesView.new
+      reopened.reload(store)
+      reopened.current_text.should eq("one")
+    end
+  end
+
   it "switch_note_by_id selects the matching note" do
     with_store do |store|
       view = NotesView.new
