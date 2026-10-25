@@ -1419,11 +1419,18 @@ module Gori
         # No row named at all is the handler's "missing required" refusal, not this one.
         return nil unless h.has_key?(selectors.first)
         return nil if h.each_key.any? { |k| !selectors.includes?(k) && !k.starts_with?('_') }
+        nothing_to_change_refusal(name)
+      end
+
+      # The refusal itself, also returned by a handler whose given fields all resolved to
+      # "leave unchanged" (update_issue `{id, title: null}`), so both calls read the same.
+      private def nothing_to_change_refusal(name : String) : Result?
+        return nil unless selectors = UPDATE_SELECTORS[name]?
         aliases = ARG_ALIASES[name]?
         declared = declared_args[name]? || return nil
         fields = declared.reject { |k| selectors.includes?(k) || aliases.try(&.has_key?(k)) }
         # "the fields it takes", not "at least one of": update_host_override needs host AND ip.
-        err("nothing to change — this call names only its row; the fields it takes: #{fields.join(", ")}", "INVALID_ARGUMENT")
+        err("nothing to change — this call sets no field; the fields it takes: #{fields.join(", ")}", "INVALID_ARGUMENT")
       end
 
       # Fold each alias the call used into its real name, or the refusal for a call that spelled

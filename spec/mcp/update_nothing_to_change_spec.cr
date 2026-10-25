@@ -33,7 +33,7 @@ describe "MCP update_* with nothing to change" do
       r = tools.call("update_rule", JSON.parse(%({"id":#{id},"scope":"project"})))
       r.is_error.should be_true
       r.error_code.should eq("INVALID_ARGUMENT")
-      r.text.should start_with("nothing to change — this call names only its row; the fields it takes: ")
+      r.text.should start_with("nothing to change — this call sets no field; the fields it takes: ")
       r.text.should contain("pattern")
       r.text.should_not contain("scope")
 
@@ -44,6 +44,18 @@ describe "MCP update_* with nothing to change" do
       r.error_code.should eq("INVALID_ARGUMENT")
       r.text.should contain("nothing to change")
       r.text.should_not contain("repeater_id")
+    end
+  end
+
+  it "gives update_issue {id} and {id, title: null} the same refusal, naming repeater_id" do
+    with_store do |store|
+      tools = tools_for(store)
+      issue = mcp_ok_json(tools, "create_issue", %({"title":"t"}))["id"].as_i64
+      bare = tools.call("update_issue", JSON.parse(%({"id":#{issue}})))
+      nulled = tools.call("update_issue", JSON.parse(%({"id":#{issue},"title":null})))
+      nulled.error_code.should eq("INVALID_ARGUMENT")
+      nulled.text.should eq(bare.text)
+      nulled.text.should contain("repeater_id")
     end
   end
 

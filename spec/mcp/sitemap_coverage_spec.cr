@@ -43,7 +43,12 @@ describe "MCP list_sitemap coverage" do
       tools = tools_for(store)
 
       call_json(tools, "{}")["entries"][0]["touched_by"].should eq(JSON.parse(%({"fuzzer":1})))
-      call_json(tools, %({"untested":true}))["entries"].as_a.should be_empty
+      empty = call_json(tools, %({"untested":true}))
+      empty["entries"].as_a.should be_empty
+      empty["note"].as_s.should contain("saved fuzz run")
+      call_json(tools, "{}")["note"]?.should be_nil
+      # A query that matches nothing is not "every endpoint is tested".
+      call_json(tools, %({"untested":true,"query":"host:nowhere.test"}))["note"]?.should be_nil
     end
   end
 

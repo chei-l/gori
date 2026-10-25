@@ -777,6 +777,24 @@ describe Gori::MCP::Server do
         p["pagination_warning"].as_s.should contain("clamped")
       end
     end
+
+    it "echoes a clamped limit the same way on list_history and list_sitemap" do
+      with_store do |store|
+        mcp_seed_flow(store)
+        tools = tools_for(store)
+        [%({"limit":0}), %({"limit":-1})].each do |args|
+          p = mcp_ok_json(tools, "list_history", args)
+          {p["limit"].as_i, p["pagination_warning"].as_s.includes?("clamped")}.should eq({1, true})
+        end
+        mcp_ok_json(tools, "list_history", %({"limit":0}))["requested_limit"].as_i.should eq(0)
+        [%({"limit":0}), %({"limit":0,"collapse_transport":true})].each do |args|
+          p = mcp_ok_json(tools, "list_sitemap", args)
+          {p["requested_limit"].as_i, p["limit"].as_i}.should eq({0, 1})
+        end
+        mcp_ok_json(tools, "list_history", %({"limit":5}))["requested_limit"]?.should be_nil
+        mcp_ok_json(tools, "list_sitemap", %({"limit":5}))["requested_limit"]?.should be_nil
+      end
+    end
   end
 
   describe "list_sitemap transport" do
@@ -1355,6 +1373,17 @@ describe "MCP get_response_body_chunk find" do
       j = JSON.parse(chunk_call(store, %({"flow_id":#{id},"find":"needle","raw":true})).text)
       j["representation"].as_s.should eq("raw")
       j["matches"].as_a.should be_empty
+    end
+  end
+
+  it "flags an offset past the end as the pager does" do
+    with_store do |store|
+      id = mcp_seed_flow(store, "ex.test", "GET", "/", 200, resp_body: "needle".to_slice)
+      j = JSON.parse(chunk_call(store, %({"flow_id":#{id},"find":"needle","offset":99})).text)
+      j["matches"].as_a.should be_empty
+      j["offset_out_of_range"].as_bool.should be_true
+      j["warning"].as_s.should contain("past the 6-byte body")
+      JSON.parse(chunk_call(store, %({"flow_id":#{id},"find":"needle"})).text)["offset_out_of_range"]?.should be_nil
     end
   end
 

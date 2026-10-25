@@ -22,7 +22,8 @@ module Gori
 
       @[Tool("list_history", requires: ["get_flow", "ql_reference"])]
       private def list_history(h) : Result
-        limit = clamp(optional_int_arg(h, "limit"), HISTORY_LIMIT)
+        req_lim = optional_int_arg(h, "limit")
+        limit = clamp(req_lim, HISTORY_LIMIT)
         before_id = optional_int_arg(h, "before_id")
         since_id = optional_int_arg(h, "since")
         # `ids` names an EXACT set — the rows the operator marked in the TUI, handed over by
@@ -232,6 +233,7 @@ module Gori
           j.object do
             j.field "returned", rows.size
             j.field "limit", limit
+            emit_clamp(j, nil, 0, req_lim, limit)
             # Which end of the list the caller is holding. `since` flips the order, which the
             # schema documented and nothing in the payload did — so an agent reading rows[0]
             # as "the newest" was right on one path and wrong on the other.
@@ -473,12 +475,20 @@ module Gori
         actor = closed_filter(h, "actor", EVENT_ACTORS)
         return actor if actor.is_a?(Result)
         kind = str(h, "kind")
+        wait_ms = wait_ms_arg(h)
+        # A cursor past every id the feed has issued would echo back on each empty page, and a
+        # tailing agent would wait on it forever; refused as `list_history` refuses one.
+        if since > 0 && (issued = store.event_id_high_water) && since > issued
+          return err("cursor #{since} is ahead of every event id this project has issued (#{issued}), " \
+                     "so it does not come from this project's feed; restart from since=0",
+            "INVALID_ARGUMENT", field: "since")
+        end
         rows, next_cursor, full = events_page(since, limit, source, kind, actor)
         # `wait_ms`: re-read past the cursor each slice — a primary-key range read that finds
         # nothing is the cheap check. Only the feed's END is waited at: a full page the filters
         # emptied answers at once with its advanced cursor, or a stored match deep in a long
         # feed would be reached one page per slice.
-        long_poll(wait_ms_arg(h)) do
+        long_poll(wait_ms) do
           rows, next_cursor, full = events_page(next_cursor, limit, source, kind, actor)
           !rows.empty? || full
         end if rows.empty? && !full
@@ -790,6 +800,11 @@ module Gori
             j.field "origin", options.request? ? "client" : "target" # as the pager labels it (#1586)
             j.field "find", pattern
             j.field "offset", options.offset
+            # Flagged as the pager flags it: an empty `matches` past the end is not "no match".
+            if options.offset > view.bytes.size
+              j.field "offset_out_of_range", true
+              j.field "warning", "requested offset #{options.offset} is past the #{view.bytes.size}-byte body; nothing was searched"
+            end
             j.field "total_bytes", view.bytes.size
             j.field "representation", view.decoded? ? "decoded" : "raw"
             j.field "decode_note", view.decode_note if view.decode_note

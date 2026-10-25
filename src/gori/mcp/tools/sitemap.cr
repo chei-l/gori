@@ -17,8 +17,8 @@ module Gori
 
       @[Tool("list_sitemap")]
       private def list_sitemap(h) : Result
-        limit = clamp(optional_int_arg(h, "limit"), SITEMAP_LIMIT)
-        offset = clamp_nonneg(optional_int_arg(h, "offset"))
+        pg = page_args(h, SITEMAP_LIMIT)
+        limit, offset = pg.limit, pg.offset
         # `tag:` is the sitemap's own field, not QL's (`Sitemap.split_tag_terms`, the cut the TUI
         # bar and `gori run sitemap` make): only the QL half is compiled, refused or reported.
         terms = Sitemap.split_tag_terms(str(h, "query") || "")
@@ -35,13 +35,7 @@ module Gori
         unrequested = bool_arg(h, "include_unrequested", false)
         untested = bool_arg(h, "untested", false)
         if bool_arg(h, "collapse_transport", false)
-          # Refused rather than dropped: an answer without the block reads as "no references".
-          return err("include_unrequested is not available with collapse_transport — call without it, or use list_js_endpoints",
-            "INVALID_ARGUMENT", field: "include_unrequested") if unrequested
-          # Coverage is keyed by origin, which a collapsed row no longer carries.
-          return err("untested is not available with collapse_transport — call without it",
-            "INVALID_ARGUMENT", field: "untested") if untested
-          return collapsed_sitemap(filter, limit, offset, dropped, terms)
+          return collapse_clash(unrequested, untested) || collapsed_sitemap(filter, pg, dropped, terms)
         end
         tags = store.sitemap_tags
         coverage = Sitemap::Coverage.load(store)
@@ -69,6 +63,7 @@ module Gori
             j.field "scanned", rows.size
             j.field "offset", offset
             j.field "limit", limit
+            emit_clamp(j, pg.req_off, pg.offset, pg.req_lim, pg.limit)
             j.field "has_more", has_more
             emit_cut(j, cut)
             emit_ignored_terms(j, dropped)
@@ -78,9 +73,30 @@ module Gori
             # mixing them in would also make `has_more`/`offset` page two different things.
             emit_unrequested(j, parts.sum(&.bytesize)) if unrequested
             emit_query_hint(j, terms.ql) if entries.empty?
+            emit_untested_note(j, untested, entries.empty?, offset, filter, terms, tags)
             j.field("entries") { raw_rows(j, parts) }
           end
         end)
+      end
+
+      # An empty `untested` first page otherwise reads as "nothing captured".
+      # The `collapse_transport` refusals, or nil.
+      private def collapse_clash(unrequested : Bool, untested : Bool) : Result?
+        # Refused rather than dropped: an answer without the block reads as "no references".
+        return err("include_unrequested is not available with collapse_transport — call without it, or use list_js_endpoints",
+          "INVALID_ARGUMENT", field: "include_unrequested") if unrequested
+        # Coverage is keyed by origin, which a collapsed row no longer carries.
+        err("untested is not available with collapse_transport — call without it",
+          "INVALID_ARGUMENT", field: "untested") if untested
+      end
+
+      # Only when coverage is what emptied the page: the same filter without it finds rows.
+      private def emit_untested_note(j : JSON::Builder, untested : Bool, empty : Bool, offset : Int32, filter : QL::Filter,
+                                     terms : Sitemap::TagTerms, tags : Hash({String, String}, String)) : Nil
+        return unless untested && empty && offset.zero?
+        return if sitemap_page(filter, 1, 0, terms, tags, nil)[0].empty?
+        j.field "note", "no untested endpoint left: any endpoint the query matches already has a recorded " \
+                        "#{FlowSource::Kind.active.join("/", &.token)} flow or a saved fuzz run; call without untested to list them"
       end
 
       # One `list_sitemap` entry: the transport key, the fold's variants, counts, seen window
@@ -369,8 +385,9 @@ module Gori
       # The legacy collapsed sitemap (distinct host/method/target only), for
       # collapse_transport:true. Its `tag:` terms prune the HOST-level tree, the one these
       # host-keyed rows make.
-      private def collapsed_sitemap(filter : QL::Filter, limit : Int32, offset : Int32,
+      private def collapsed_sitemap(filter : QL::Filter, pg : Page,
                                     dropped : Array(String), terms : Sitemap::TagTerms) : Result
+        limit, offset = pg.limit, pg.offset
         tag_capped = false
         if terms.filtering?
           all = store.sitemap_entries(filter, Store::SITEMAP_MAX)
@@ -391,6 +408,7 @@ module Gori
             j.field "returned", parts.size
             j.field "offset", offset
             j.field "limit", limit
+            emit_clamp(j, pg.req_off, pg.offset, pg.req_lim, pg.limit)
             j.field "has_more", has_more
             emit_cut(j, cut)
             emit_ignored_terms(j, dropped)
