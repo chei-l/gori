@@ -422,7 +422,9 @@ module Gori
           STDERR.puts "gori run project export: #{terminal_project_name(project.name, quoted: true)} — " \
                       "#{ProjectArchive.disclosure(prepared.inventory)}"
           destination = begin
-            prepared.write(output_path, overwrite: force)
+            # The operator's path is theirs (no `archives_only`), but never inside the projects
+            # dir: `--force` over a project's own database would leave it unopenable.
+            prepared.write(output_path, overwrite: force, protected_dir: Paths.projects_dir)
           rescue ex : ProjectArchive::DestinationExists
             prepared.close
             abort "gori run project export: #{ex.message} (use --force to replace it)"
@@ -450,7 +452,7 @@ module Gori
         format = :text
         project_flag = nil.as(String?)
         positional = parse_args(args, "gori run project export") do |p|
-          p.banner = "Usage: gori run project export <name> -o PATH [--force]\n\n" \
+          p.banner = "Usage: gori run project export <name> | --project NAME -o PATH [--force] [--format json]\n\n" \
                      "Snapshot a project database into one portable .gori archive."
           p.on("-o PATH", "--output=PATH", "Write the archive to PATH") { |v| output = v }
           p.on("--force", "Replace an existing destination file") { force = true }
@@ -476,7 +478,7 @@ module Gori
         name = nil.as(String?)
         format = :text
         positional = parse_args(args, "gori run project import") do |p|
-          p.banner = "Usage: gori run project import <archive.gori> [--name NEW]\n\n" \
+          p.banner = "Usage: gori run project import <archive.gori> [--name NEW] [--format json]\n\n" \
                      "Validate and register a portable project archive."
           p.on("--name=NAME", "Display name for the imported project (default: archive name)") { |v| name = v }
           format_flag(p, [:text, :json], "Output: text (default) | json") { |f| format = f }
@@ -1059,6 +1061,11 @@ module Gori
 
         id_s = positional.first? || abort("gori run project scope update: <id> is required (see `gori run project scope list`)")
         id = id_s.to_i64? || abort("gori run project scope update: invalid rule id #{id_s.inspect}")
+        # Printing "updated" for a call that sets no field told a script its edit landed;
+        # `issues update` and MCP `update_scope_rule` refuse it the same way.
+        if kind.nil? && match_type.nil? && pattern.nil?
+          abort "gori run project scope update: nothing to change — pass --kind, --type and/or --pattern"
+        end
         # An ABSENT --pattern keeps the current one; a SUPPLIED blank one is a mistake, not a
         # no-op — keeping the old pattern reported success for an edit that never happened, on
         # the rule that gates outbound traffic. MCP's `update_scope_rule` refuses it the same way.
@@ -1584,12 +1591,16 @@ module Gori
             abort "gori run project host-override add: give BOTH --host and --ip, or the positional IP HOST form (not a mix)"
           else
             abort "gori run project host-override add: need --host and --ip, or positional IP HOST" if positional.empty?
-            parsed = HostOverrides.parse_line(positional.join(' '))
-            abort "gori run project host-override add: invalid entry (expected IP HOST; IP must be a literal)" unless parsed
-            parsed
+            # Split as `HostOverrides.parse_line` does, but validate below so the refusal names
+            # the half that is wrong instead of blaming the IP for a bad HOST.
+            parts = Utf8.subject(positional.join(' ')).strip.split(/\s+/, 2)
+            abort "gori run project host-override add: invalid entry (expected IP HOST)" if parts.size < 2
+            {parts[1].strip, parts[0]}
           end
         h, i = pair
-        abort "gori run project host-override add: invalid host/ip (host hostname-shaped; ip an IPv4/IPv6 literal, optionally IP:PORT or [v6]:PORT)" unless HostOverrides.valid?(h, i)
+        if err = HostOverrides.validation_error(h, i)
+          abort "gori run project host-override add: #{err}"
+        end
 
         project = resolve_read_project(proj.name, proj.db)
         with_store(project) do |store|
@@ -1638,7 +1649,9 @@ module Gori
         h = host
         i = ip
         abort "gori run project host-override update: --host and --ip are both required" unless h && i
-        abort "gori run project host-override update: invalid host/ip (host hostname-shaped; ip an IPv4/IPv6 literal, optionally IP:PORT or [v6]:PORT)" unless HostOverrides.valid?(h, i)
+        if err = HostOverrides.validation_error(h, i)
+          abort "gori run project host-override update: #{err}"
+        end
 
         project = resolve_read_project(proj.name, proj.db)
         with_store(project) do |store|

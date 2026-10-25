@@ -46,7 +46,7 @@ module Gori
         name, kind, host, token, enabled = fields
         # A provider the AGENT saves is not the operator's configuration, so it is judged like
         # an inline `oast_start` server; otherwise saving it first would be the way around that.
-        if refusal = oast_endpoint_refusal(host, "host")
+        if refusal = oast_provider_host_refusal(host)
           return refusal
         end
         position = store.oast_providers.size
@@ -84,7 +84,7 @@ module Gori
         name = str(h, "name").try(&.strip).presence || existing.name
         host = str(h, "host").try(&.strip).presence || existing.host
         # Only a host this call names: an operator's saved host stays theirs (see create).
-        if present?(h, "host") && (refusal = oast_endpoint_refusal(host, "host"))
+        if present?(h, "host") && (refusal = oast_provider_host_refusal(host))
           return refusal
         end
         # `presence ||` cannot express "clear it": an explicit `"token": ""` folded into the
@@ -119,6 +119,15 @@ module Gori
         return row if row.is_a?(Result)
         return busy("provider NOT deleted (store busy or unwritable); it is unchanged") unless store.delete_oast_provider(row)
         Result.new({"deleted" => 1, "id" => "p_#{row}"}.to_json)
+      end
+
+      # A host this call names: refused when it cannot be one (`Oast::Provider.endpoint_error`,
+      # the check `gori run oast providers` makes too), or when the Sandbox blocks it.
+      private def oast_provider_host_refusal(host : String) : Result?
+        if e = Oast::Provider.endpoint_error(host)
+          return err(e, "INVALID_ARGUMENT", field: "host")
+        end
+        oast_endpoint_refusal(host, "host")
       end
 
       # The PROJECT row id behind a "p_<rowid>" key, refusing a global one. A global provider

@@ -144,7 +144,7 @@ describe Gori::Import do
         result = Gori::Import.import_file(store, :urls, urls)
         {result.count, result.skipped}.should eq({1, 2})
         result.notes.size.should eq(2)
-        result.notes[0].should start_with("skipped line 3: invalid URL (missing scheme)")
+        result.notes[0].should start_with("skipped line 3: invalid URL (ftp: is not a transport gori speaks)")
         result.notes[1].should start_with("skipped line 4: invalid URL (port out of range)")
       end
     ensure
@@ -368,6 +368,12 @@ describe Gori::Import do
       insomnia = %({"_type": "export", "__export_format": 4, "resources": [) +
                  %({"_id": "r", "_type": "request", "method": "GET", "url": "https://bom.test/b"}]})
       Gori::Import.import_text(store, :insomnia, "\u{FEFF}#{insomnia}").count.should eq(1)
+    end
+  end
+
+  it "calls imported TEXT text, not a file, in a parse error" do
+    with_store do |store|
+      expect_raises(Gori::Error, /\AHAR text is not valid JSON/) { Gori::Import.import_text(store, :har, "{nope") }
     end
   end
 
@@ -747,6 +753,7 @@ describe Gori::Import do
         result = Gori::Import.import_file(store, :har, har)
         result.count.should eq(1)   # the valid entry imported (was: whole import aborted)
         result.skipped.should eq(1) # the bad-base64 entry skipped
+        result.notes.should eq(["skipped entry 1: response content is not valid base64 (Unexpected byte 0x21 at 0)"])
       end
     ensure
       File.delete?(har)
